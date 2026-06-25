@@ -1,14 +1,42 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! `kernel` — the xray-rs data plane and shared value types.
+//!
+//! Connection-path code parses attacker-controlled bytes, so this crate is held
+//! to SPEC §P7: no panics, no unchecked indexing, no unchecked arithmetic.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod copy;
+pub mod dialer;
+pub mod dispatcher;
+pub mod dns;
+pub mod error;
+pub mod net;
+pub mod outbound;
+pub mod pipe;
+pub mod policy;
+pub mod router;
+pub mod session;
+pub mod timer;
+pub mod uuid;
+
+pub use dialer::SystemDialer;
+pub use dispatcher::Dispatcher;
+pub use dns::Resolver;
+pub use error::{Error, Result};
+pub use net::{AddrCodec, Address, Destination, Family, Network, PortOrder};
+pub use outbound::Outbound;
+pub use pipe::{Link, UdpLink, UdpPacket};
+pub use policy::Policy;
+pub use router::{Cidr, DomainMatcher, RouteCtx, Router, Rule};
+pub use session::Ctx;
+pub use timer::Timer;
+pub use uuid::Uuid;

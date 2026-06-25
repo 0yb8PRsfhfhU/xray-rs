@@ -1,9 +1,66 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "proxy", "transport"]
+members = ["kernel", "proxy", "transport", "app"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
 
 [workspace.dependencies]
-tokio = {
-    version = "1.52",
-    features = ["rt-multi-thread"]
-}
+# internal
+kernel = { path = "kernel" }
+proxy = { path = "proxy" }
+transport = { path = "transport" }
+
+# runtime
+tokio = { version = "1.44", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+futures = "0.3"
+bytes = "1"
+
+# data values
+compact_str = "0.8"
+arc-swap = "1"
+moka = { version = "0.12", features = ["future"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+
+# tls (OpenSSL per objective, not rustls)
+openssl = "0.10"
+tokio-openssl = "0.6"
+
+# transports
+tokio-tungstenite = "0.24"
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+h2 = "0.4"
+
+# crypto
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+sha3 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
+crc32fast = "1"
+uuid = { version = "1", features = ["v4"] }
+
+# dns
+hickory-resolver = "0.24"
+
+# sockets
+socket2 = { version = "0.5", features = ["all"] }
+
+# config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"

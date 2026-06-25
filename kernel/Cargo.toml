@@ -1,6 +1,25 @@
 [package]
 name = "kernel"
-version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
 
 [dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+bytes.workspace = true
+compact_str.workspace = true
+arc-swap.workspace = true
+moka.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+uuid.workspace = true
+sha1.workspace = true
+hickory-resolver.workspace = true
+socket2.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+hex.workspace = true
