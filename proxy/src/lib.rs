@@ -12,7 +12,9 @@
     clippy::arithmetic_side_effects
 )]
 
+pub mod crypto;
 pub mod io;
+pub mod shadowsocks;
 pub mod trojan;
 pub mod udp;
 pub mod vless;
@@ -22,6 +24,7 @@ use std::io as stdio;
 use kernel::{Ctx, Dispatcher, Policy};
 use transport::Stream;
 
+pub use shadowsocks::Shadowsocks;
 pub use trojan::{Trojan, TrojanUsers};
 pub use vless::{Vless, VlessUsers};
 
@@ -29,6 +32,7 @@ pub use vless::{Vless, VlessUsers};
 pub enum Inbound {
     Trojan(Trojan),
     Vless(Vless),
+    Shadowsocks(Shadowsocks),
 }
 
 impl Inbound {
@@ -43,6 +47,7 @@ impl Inbound {
         match self {
             Inbound::Trojan(h) => h.process(ctx, conn, disp, policy).await,
             Inbound::Vless(h) => h.process(ctx, conn, disp, policy).await,
+            Inbound::Shadowsocks(h) => h.process(ctx, conn, disp, policy).await,
         }
     }
 }

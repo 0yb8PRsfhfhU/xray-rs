@@ -10,11 +10,10 @@ use serde::Deserialize;
 
 use kernel::router::{Cidr, DomainMatcher, Router, Rule};
 use kernel::{Dispatcher, Network, Outbound, Resolver, SystemDialer};
-use proxy::{Inbound, Trojan, TrojanUsers, Vless, VlessUsers};
+use proxy::{Inbound, Shadowsocks, Trojan, TrojanUsers, Vless, VlessUsers};
 use transport::{
     HttpUpgradeConfig, Security, StreamConfig, TlsServer, TransportKind, WsConfig,
 };
-
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -39,6 +38,7 @@ pub struct InboundCfg {
     pub listen: String,
     pub port: u16,
     pub protocol: String,
+    pub method: Option<String>,
     #[serde(default)]
     pub users: Vec<UserCfg>,
     pub tls: Option<TlsCfg>,
@@ -251,6 +251,23 @@ fn build_inbound(ib: InboundCfg) -> Result<InboundInstance> {
                 users.push((pw, CompactString::new(&u.email), u.level));
             }
             Inbound::Trojan(Trojan::new(Arc::new(TrojanUsers::new(users))))
+        }
+        "shadowsocks" | "ss" => {
+            let method = ib
+                .method
+                .as_deref()
+                .ok_or_else(|| anyhow!("shadowsocks inbound missing method"))?;
+            let kind = proxy::shadowsocks::method_kind(method)
+                .ok_or_else(|| anyhow!("unsupported shadowsocks method: {method}"))?;
+            let mut users = Vec::new();
+            for u in &ib.users {
+                let pw = u
+                    .password
+                    .clone()
+                    .ok_or_else(|| anyhow!("shadowsocks user missing password"))?;
+                users.push((pw, CompactString::new(&u.email), u.level));
+            }
+            Inbound::Shadowsocks(Shadowsocks::new(kind, users))
         }
         other => bail!("unknown/unsupported inbound protocol: {other}"),
     };

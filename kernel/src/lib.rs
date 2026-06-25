@@ -25,6 +25,7 @@ pub mod pipe;
 pub mod policy;
 pub mod router;
 pub mod session;
+pub mod sniff;
 pub mod timer;
 pub mod uuid;
 
@@ -38,5 +39,6 @@ pub use pipe::{Link, UdpLink, UdpPacket};
 pub use policy::Policy;
 pub use router::{Cidr, DomainMatcher, RouteCtx, Router, Rule};
 pub use session::Ctx;
+pub use sniff::{SniffedProtocol, sniff, sniff_http, sniff_tls};
 pub use timer::Timer;
 pub use uuid::Uuid;
