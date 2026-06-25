@@ -13,6 +13,9 @@ pub struct Policy {
 
 impl Default for Policy {
     fn default() -> Policy {
-        Policy { handshake: Duration::from_secs(60), idle: Duration::from_secs(300) }
+        Policy {
+            handshake: Duration::from_secs(60),
+            idle: Duration::from_secs(300),
+        }
     }
 }

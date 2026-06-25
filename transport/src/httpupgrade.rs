@@ -55,7 +55,10 @@ where
         }
     }
     if connection != "upgrade" || upgrade != "websocket" {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unrecognized request"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unrecognized request",
+        ));
     }
 
     s.write_all(RESPONSE).await?;
@@ -72,14 +75,20 @@ where
     loop {
         let n = s.read(&mut byte).await?;
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof in request"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "eof in request",
+            ));
         }
         buf.extend_from_slice(&byte);
         if buf.ends_with(b"\r\n\r\n") {
             return Ok(buf);
         }
         if buf.len() > MAX_HEAD {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "request head too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request head too large",
+            ));
         }
     }
 }

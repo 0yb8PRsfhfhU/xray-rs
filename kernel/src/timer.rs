@@ -21,8 +21,16 @@ impl Timer {
     /// Start a timer with the given idle timeout and a fresh cancellation token.
     pub fn new(idle: Duration) -> Timer {
         let token = CancellationToken::new();
-        let deadline = Arc::new(Mutex::new(Instant::now().checked_add(idle).unwrap_or_else(Instant::now)));
-        let timer = Timer { deadline, idle, token: token.clone() };
+        let deadline = Arc::new(Mutex::new(
+            Instant::now()
+                .checked_add(idle)
+                .unwrap_or_else(Instant::now),
+        ));
+        let timer = Timer {
+            deadline,
+            idle,
+            token: token.clone(),
+        };
         let bg = timer.clone();
         tokio::spawn(async move {
             loop {
@@ -51,7 +59,9 @@ impl Timer {
     /// Reset the idle deadline to `now + idle`.
     pub fn update(&self) {
         if let Ok(mut g) = self.deadline.lock() {
-            *g = Instant::now().checked_add(self.idle).unwrap_or_else(Instant::now);
+            *g = Instant::now()
+                .checked_add(self.idle)
+                .unwrap_or_else(Instant::now);
         }
     }
 

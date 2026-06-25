@@ -10,9 +10,12 @@ use serde::Deserialize;
 
 use kernel::router::{Cidr, DomainMatcher, Router, Rule};
 use kernel::{Dispatcher, Network, Outbound, Resolver, SystemDialer};
-use proxy::{Inbound, Shadowsocks, Trojan, TrojanUsers, Vless, VlessUsers};
+use proxy::{
+    Dokodemo, Http, HttpAccount, Inbound, Shadowsocks, Socks, SocksAccount, Trojan, TrojanUsers,
+    Vless, VlessUsers, Vmess, VmessUsers,
+};
 use transport::{
-    HttpUpgradeConfig, Security, StreamConfig, TlsServer, TransportKind, WsConfig,
+    GrpcConfig, HttpUpgradeConfig, Security, StreamConfig, TlsServer, TransportKind, WsConfig,
 };
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
@@ -43,6 +46,9 @@ pub struct InboundCfg {
     pub users: Vec<UserCfg>,
     pub tls: Option<TlsCfg>,
     pub transport: Option<TransportCfg>,
+    /// dokodemo-door fixed relay target (host/domain). `port` is the LISTEN port.
+    pub target_address: Option<String>,
+    pub target_port: Option<u16>,
 }
 
 fn default_listen() -> String {
@@ -52,6 +58,7 @@ fn default_listen() -> String {
 #[derive(Debug, Deserialize)]
 pub struct UserCfg {
     pub uuid: Option<String>,
+    pub username: Option<String>,
     pub password: Option<String>,
     #[serde(default)]
     pub email: String,
@@ -73,6 +80,7 @@ pub struct TransportCfg {
     #[serde(default)]
     pub path: String,
     pub host: Option<String>,
+    pub service_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,12 +171,18 @@ impl Config {
             inbounds.push(build_inbound(ib)?);
         }
 
-        Ok(Built { dispatcher, inbounds })
+        Ok(Built {
+            dispatcher,
+            inbounds,
+        })
     }
 }
 
 fn build_rule(r: &RouteCfg) -> Result<Rule> {
-    let mut rule = Rule { outbound_tag: CompactString::new(&r.outbound), ..Rule::default() };
+    let mut rule = Rule {
+        outbound_tag: CompactString::new(&r.outbound),
+        ..Rule::default()
+    };
     for n in &r.network {
         match n.as_str() {
             "tcp" => rule.networks.push(Network::Tcp),
@@ -180,10 +194,12 @@ fn build_rule(r: &RouteCfg) -> Result<Rule> {
         rule.domains.push(parse_domain_matcher(d));
     }
     for ip in &r.ip {
-        rule.ips.push(Cidr::parse(ip).ok_or_else(|| anyhow!("bad ip cidr: {ip}"))?);
+        rule.ips
+            .push(Cidr::parse(ip).ok_or_else(|| anyhow!("bad ip cidr: {ip}"))?);
     }
     for s in &r.source {
-        rule.source_ips.push(Cidr::parse(s).ok_or_else(|| anyhow!("bad source cidr: {s}"))?);
+        rule.source_ips
+            .push(Cidr::parse(s).ok_or_else(|| anyhow!("bad source cidr: {s}"))?);
     }
     for p in &r.port {
         rule.ports.push(parse_port_range(p)?);
@@ -241,6 +257,19 @@ fn build_inbound(ib: InboundCfg) -> Result<InboundInstance> {
             }
             Inbound::Vless(Vless::new(Arc::new(VlessUsers::new(users))))
         }
+        "vmess" => {
+            let mut users = Vec::new();
+            for u in &ib.users {
+                let uuid = u
+                    .uuid
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("vmess user missing uuid"))?;
+                let id = kernel::Uuid::parse_str(uuid).map_err(|e| anyhow!("bad uuid: {e}"))?;
+                users.push((id, CompactString::new(&u.email), u.level));
+            }
+            let table = VmessUsers::new(users).map_err(|e| anyhow!("vmess users: {e}"))?;
+            Inbound::Vmess(Vmess::new(Arc::new(table)))
+        }
         "trojan" => {
             let mut users = Vec::new();
             for u in &ib.users {
@@ -269,6 +298,46 @@ fn build_inbound(ib: InboundCfg) -> Result<InboundInstance> {
             }
             Inbound::Shadowsocks(Shadowsocks::new(kind, users))
         }
+        "socks" | "socks5" => {
+            let mut accounts = Vec::new();
+            for u in &ib.users {
+                let username = u
+                    .username
+                    .clone()
+                    .ok_or_else(|| anyhow!("socks user missing username"))?;
+                let password = u
+                    .password
+                    .clone()
+                    .ok_or_else(|| anyhow!("socks user missing password"))?;
+                accounts.push(SocksAccount { username, password });
+            }
+            Inbound::Socks(Socks::new(accounts))
+        }
+        "http" => {
+            let mut accounts = Vec::new();
+            for u in &ib.users {
+                let username = u
+                    .username
+                    .clone()
+                    .ok_or_else(|| anyhow!("http user missing username"))?;
+                let password = u
+                    .password
+                    .clone()
+                    .ok_or_else(|| anyhow!("http user missing password"))?;
+                accounts.push(HttpAccount { username, password });
+            }
+            Inbound::Http(Http::new(accounts))
+        }
+        "dokodemo" | "dokodemo-door" => {
+            let addr = ib
+                .target_address
+                .as_deref()
+                .ok_or_else(|| anyhow!("dokodemo inbound missing target_address"))?;
+            let port = ib
+                .target_port
+                .ok_or_else(|| anyhow!("dokodemo inbound missing target_port"))?;
+            Inbound::Dokodemo(Dokodemo::new(kernel::Address::parse(addr), port))
+        }
         other => bail!("unknown/unsupported inbound protocol: {other}"),
     };
 
@@ -293,8 +362,8 @@ fn build_stream(ib: &InboundCfg) -> Result<StreamConfig> {
                 .alpn
                 .clone()
                 .unwrap_or_else(|| vec!["h2".to_string(), "http/1.1".to_string()]);
-            let server = TlsServer::from_pem(&cert, &key, &alpn)
-                .map_err(|e| anyhow!("tls setup: {e}"))?;
+            let server =
+                TlsServer::from_pem(&cert, &key, &alpn).map_err(|e| anyhow!("tls setup: {e}"))?;
             Security::Tls(Arc::new(server))
         }
     };
@@ -311,9 +380,15 @@ fn build_stream(ib: &InboundCfg) -> Result<StreamConfig> {
                 path: t.path.clone(),
                 host: t.host.clone(),
             })),
+            "grpc" | "gun" => TransportKind::Grpc(Arc::new(GrpcConfig {
+                service_name: t.service_name.clone().unwrap_or_default(),
+            })),
             other => bail!("unknown transport: {other}"),
         },
     };
 
-    Ok(StreamConfig { security, transport })
+    Ok(StreamConfig {
+        security,
+        transport,
+    })
 }

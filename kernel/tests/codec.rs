@@ -34,9 +34,15 @@ fn address_reading() {
     assert!(rd(std, &[1, 0, 0, 0, 0]).is_err());
 
     // IPv6, port-last
-    let (a, p) =
-        rd(std, &[4, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 0, 80]).unwrap();
-    assert_eq!(a, Address::from_ip_bytes(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6]).unwrap());
+    let (a, p) = rd(
+        std,
+        &[4, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 0, 80],
+    )
+    .unwrap();
+    assert_eq!(
+        a,
+        Address::from_ip_bytes(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6]).unwrap()
+    );
     assert_eq!(p, 80);
 
     // Domain example.com:80

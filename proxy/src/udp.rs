@@ -27,7 +27,10 @@ impl<R: AsyncRead + Unpin> Framed<R> {
     }
 
     /// Read and decode one frame, growing the buffer as needed.
-    async fn frame<T>(&mut self, mut parse: impl FnMut(&mut Bytes) -> Result<T, Error>) -> io::Result<T> {
+    async fn frame<T>(
+        &mut self,
+        mut parse: impl FnMut(&mut Bytes) -> Result<T, Error>,
+    ) -> io::Result<T> {
         let mut chunk = [0u8; 4096];
         loop {
             let snap = Bytes::copy_from_slice(&self.buf);
@@ -43,7 +46,10 @@ impl<R: AsyncRead + Unpin> Framed<R> {
             }
             let n = self.r.read(&mut chunk).await?;
             if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof in udp frame"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "eof in udp frame",
+                ));
             }
             self.buf.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
         }
@@ -77,7 +83,14 @@ pub async fn relay_trojan_udp(
         loop {
             let (target, payload) = framed.frame(parse_trojan_packet).await?;
             timer.update();
-            if writer.send(UdpPacket { data: payload, target }).await.is_err() {
+            if writer
+                .send(UdpPacket {
+                    data: payload,
+                    target,
+                })
+                .await
+                .is_err()
+            {
                 return io::Result::Ok(());
             }
         }
@@ -135,7 +148,14 @@ pub async fn relay_vless_udp(
         loop {
             let payload = framed.frame(parse_vless_packet).await?;
             timer.update();
-            if writer.send(UdpPacket { data: payload, target: target.clone() }).await.is_err() {
+            if writer
+                .send(UdpPacket {
+                    data: payload,
+                    target: target.clone(),
+                })
+                .await
+                .is_err()
+            {
                 return io::Result::Ok(());
             }
         }

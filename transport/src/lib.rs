@@ -12,6 +12,7 @@
     clippy::arithmetic_side_effects
 )]
 
+pub mod grpc;
 pub mod httpupgrade;
 pub mod listener;
 pub mod stream;
@@ -22,6 +23,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpStream;
 
+pub use grpc::GrpcConfig;
 pub use httpupgrade::HttpUpgradeConfig;
 pub use listener::{SocketOpts, bind_tcp};
 pub use stream::{Raw, Stream};
@@ -41,6 +43,7 @@ pub enum TransportKind {
     Raw,
     Ws(Arc<WsConfig>),
     HttpUpgrade(Arc<HttpUpgradeConfig>),
+    Grpc(Arc<grpc::GrpcConfig>),
 }
 
 /// Full inbound stream configuration: security + transport.
@@ -52,7 +55,10 @@ pub struct StreamConfig {
 
 impl StreamConfig {
     pub fn raw() -> StreamConfig {
-        StreamConfig { security: Security::None, transport: TransportKind::Raw }
+        StreamConfig {
+            security: Security::None,
+            transport: TransportKind::Raw,
+        }
     }
 }
 
@@ -72,6 +78,10 @@ pub async fn accept_stream(tcp: TcpStream, cfg: &StreamConfig) -> std::io::Resul
         TransportKind::HttpUpgrade(cfg) => {
             let raw = httpupgrade::accept(raw, cfg).await?;
             Ok(Stream::Raw(raw))
+        }
+        TransportKind::Grpc(cfg) => {
+            let grpc = grpc::accept(raw, cfg).await?;
+            Ok(Stream::Grpc(Box::new(grpc)))
         }
     }
 }

@@ -37,12 +37,17 @@ where
     /// Wrap an already-handshaked server websocket stream, seeding any decoded
     /// early-data into the read buffer.
     pub fn new(inner: WebSocketStream<S>, early_data: Bytes) -> WsStream<S> {
-        WsStream { inner, read_buf: early_data, eof: false }
+        WsStream {
+            inner,
+            read_buf: early_data,
+            eof: false,
+        }
     }
 }
 
 /// Perform the server-side WebSocket upgrade, validating path/host and decoding
 /// `Sec-WebSocket-Protocol` early-data (xray-compatible).
+#[allow(clippy::result_large_err)]
 pub async fn accept<S>(stream: S, cfg: &WsConfig) -> io::Result<WsStream<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -67,25 +72,23 @@ where
                 return Err(reject(404, "bad host"));
             }
         }
-        if let Some(proto) = req.headers().get("sec-websocket-protocol") {
-            if let Ok(s) = proto.to_str() {
-                if let Some(ed) = decode_early_data(s) {
-                    if !ed.is_empty() {
-                        if let Ok(mut g) = early_cb.lock() {
-                            *g = ed;
-                        }
-                        resp.headers_mut().insert(
-                            "sec-websocket-protocol",
-                            proto.clone(),
-                        );
-                    }
-                }
+        if let Some(proto) = req.headers().get("sec-websocket-protocol")
+            && let Ok(s) = proto.to_str()
+            && let Some(ed) = decode_early_data(s)
+            && !ed.is_empty()
+        {
+            if let Ok(mut g) = early_cb.lock() {
+                *g = ed;
             }
+            resp.headers_mut()
+                .insert("sec-websocket-protocol", proto.clone());
         }
         Ok(resp)
     };
 
-    let ws = accept_hdr_async(stream, callback).await.map_err(io::Error::other)?;
+    let ws = accept_hdr_async(stream, callback)
+        .await
+        .map_err(io::Error::other)?;
     let early_data = early.lock().map(|g| g.clone()).unwrap_or_default();
     Ok(WsStream::new(ws, early_data))
 }
@@ -98,12 +101,15 @@ fn reject(code: u16, msg: &str) -> ErrorResponse {
 
 /// Decode xray ws early-data: normalize to URL-safe base64, strip padding.
 fn decode_early_data(s: &str) -> Option<Bytes> {
-    let norm: String = s.chars().filter_map(|c| match c {
-        '+' => Some('-'),
-        '/' => Some('_'),
-        '=' => None,
-        other => Some(other),
-    }).collect();
+    let norm: String = s
+        .chars()
+        .filter_map(|c| match c {
+            '+' => Some('-'),
+            '/' => Some('_'),
+            '=' => None,
+            other => Some(other),
+        })
+        .collect();
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(norm.as_bytes())
         .ok()
@@ -156,17 +162,23 @@ where
         let me = self.get_mut();
         ready!(Pin::new(&mut me.inner).poll_ready(cx)).map_err(io::Error::other)?;
         let msg = Message::Binary(buf.to_vec());
-        Pin::new(&mut me.inner).start_send(msg).map_err(io::Error::other)?;
+        Pin::new(&mut me.inner)
+            .start_send(msg)
+            .map_err(io::Error::other)?;
         Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let me = self.get_mut();
-        Pin::new(&mut me.inner).poll_flush(cx).map_err(io::Error::other)
+        Pin::new(&mut me.inner)
+            .poll_flush(cx)
+            .map_err(io::Error::other)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let me = self.get_mut();
-        Pin::new(&mut me.inner).poll_close(cx).map_err(io::Error::other)
+        Pin::new(&mut me.inner)
+            .poll_close(cx)
+            .map_err(io::Error::other)
     }
 }

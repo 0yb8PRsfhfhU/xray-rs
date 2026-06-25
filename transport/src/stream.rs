@@ -12,6 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_openssl::SslStream;
 
+use crate::grpc::GrpcStream;
 use crate::ws::WsStream;
 
 /// The transport-security layer.
@@ -64,6 +65,7 @@ impl AsyncWrite for Raw {
 pub enum Stream {
     Raw(Raw),
     Ws(Box<WsStream<Raw>>),
+    Grpc(Box<GrpcStream<Raw>>),
 }
 
 impl AsyncRead for Stream {
@@ -75,6 +77,7 @@ impl AsyncRead for Stream {
         match self.get_mut() {
             Stream::Raw(s) => Pin::new(s).poll_read(cx, buf),
             Stream::Ws(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            Stream::Grpc(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -88,6 +91,7 @@ impl AsyncWrite for Stream {
         match self.get_mut() {
             Stream::Raw(s) => Pin::new(s).poll_write(cx, buf),
             Stream::Ws(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            Stream::Grpc(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
@@ -95,6 +99,7 @@ impl AsyncWrite for Stream {
         match self.get_mut() {
             Stream::Raw(s) => Pin::new(s).poll_flush(cx),
             Stream::Ws(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            Stream::Grpc(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
@@ -102,6 +107,7 @@ impl AsyncWrite for Stream {
         match self.get_mut() {
             Stream::Raw(s) => Pin::new(s).poll_shutdown(cx),
             Stream::Ws(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            Stream::Grpc(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }

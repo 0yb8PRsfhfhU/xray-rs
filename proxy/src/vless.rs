@@ -13,7 +13,7 @@ use tokio::io::AsyncWriteExt;
 
 use kernel::error::Error;
 use kernel::net::{self, AddrCodec};
-use kernel::{Ctx, Destination, Dispatcher, Network, Policy, Timer, Uuid};
+use kernel::{Ctx, Destination, Dispatcher, Policy, Timer, Uuid};
 use transport::Stream;
 
 use crate::io::{read_header, relay_tcp};
@@ -21,6 +21,7 @@ use crate::udp::relay_vless_udp;
 
 const CMD_TCP: u8 = 1;
 const CMD_UDP: u8 = 2;
+const CMD_MUX: u8 = 3;
 
 /// A VLESS user identity.
 #[derive(Debug)]
@@ -53,7 +54,14 @@ impl VlessUsers {
     }
 }
 
-fn parse(buf: &mut Bytes, users: &VlessUsers) -> Result<Destination, Error> {
+/// A decoded VLESS request: TCP/UDP target, or a mux.cool carrier.
+enum VlessReq {
+    Tcp(Destination),
+    Udp(Destination),
+    Mux,
+}
+
+fn parse(buf: &mut Bytes, users: &VlessUsers) -> Result<VlessReq, Error> {
     let ver = net::take_u8(buf)?;
     if ver != 0 {
         return Err(Error::Protocol("vless version"));
@@ -67,13 +75,18 @@ fn parse(buf: &mut Bytes, users: &VlessUsers) -> Result<Destination, Error> {
         let _ = net::take(buf, addon_len)?;
     }
     let cmd = net::take_u8(buf)?;
-    let network = match cmd {
-        CMD_TCP => Network::Tcp,
-        CMD_UDP => Network::Udp,
-        _ => return Err(Error::Protocol("vless command")),
-    };
-    let (address, port) = AddrCodec::VLESS.read(buf)?;
-    Ok(Destination { network, address, port })
+    match cmd {
+        CMD_TCP => {
+            let (address, port) = AddrCodec::VLESS.read(buf)?;
+            Ok(VlessReq::Tcp(Destination::tcp(address, port)))
+        }
+        CMD_UDP => {
+            let (address, port) = AddrCodec::VLESS.read(buf)?;
+            Ok(VlessReq::Udp(Destination::udp(address, port)))
+        }
+        CMD_MUX => Ok(VlessReq::Mux),
+        _ => Err(Error::Protocol("vless command")),
+    }
 }
 
 /// VLESS inbound handler.
@@ -94,14 +107,22 @@ impl Vless {
         policy: &Policy,
     ) -> io::Result<()> {
         let users = self.users.clone();
-        let (dest, leftover) =
-            read_header(&mut conn, policy.handshake, 16384, move |b| parse(b, &users)).await?;
+        let (req, leftover) = read_header(&mut conn, policy.handshake, 16384, move |b| {
+            parse(b, &users)
+        })
+        .await?;
         // Response header: version 0, zero-length addons.
         conn.write_all(&[0u8, 0u8]).await?;
-        let timer = Timer::new(policy.idle);
-        match dest.network {
-            Network::Udp => relay_vless_udp(conn, dest, leftover, ctx, disp, timer).await,
-            _ => relay_tcp(conn, dest, leftover, ctx, disp, timer).await,
+        match req {
+            VlessReq::Tcp(dest) => {
+                let timer = Timer::new(policy.idle);
+                relay_tcp(conn, dest, leftover, ctx, disp, timer).await
+            }
+            VlessReq::Udp(dest) => {
+                let timer = Timer::new(policy.idle);
+                relay_vless_udp(conn, dest, leftover, ctx, disp, timer).await
+            }
+            VlessReq::Mux => crate::mux::serve(conn, leftover, ctx, disp, policy).await,
         }
     }
 }

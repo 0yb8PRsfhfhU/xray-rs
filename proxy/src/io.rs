@@ -41,11 +41,17 @@ where
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
             }
             if acc.len() >= max {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "header too large"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "header too large",
+                ));
             }
             let n = conn.read(&mut chunk).await?;
             if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof during header"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "eof during header",
+                ));
             }
             acc.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
         }
@@ -69,7 +75,12 @@ pub async fn relay_tcp<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let link = disp.dispatch_tcp(ctx, dest, timer.clone());
+    let sniffed = if leftover.is_empty() {
+        None
+    } else {
+        kernel::sniff::sniff(&leftover).map(|(_, domain)| domain)
+    };
+    let link = disp.dispatch_tcp_sniffed(ctx, dest, sniffed.as_deref(), timer.clone());
     if !leftover.is_empty() {
         link.writer
             .send(leftover)

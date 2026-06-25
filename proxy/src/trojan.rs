@@ -68,8 +68,16 @@ fn parse(buf: &mut Bytes, users: &TrojanUsers) -> Result<Destination, Error> {
     let cmd = net::take_u8(buf)?;
     let (address, port) = AddrCodec::TROJAN.read(buf)?;
     let _crlf2 = net::take(buf, 2)?;
-    let network = if cmd == CMD_UDP { Network::Udp } else { Network::Tcp };
-    Ok(Destination { network, address, port })
+    let network = if cmd == CMD_UDP {
+        Network::Udp
+    } else {
+        Network::Tcp
+    };
+    Ok(Destination {
+        network,
+        address,
+        port,
+    })
 }
 
 /// Trojan inbound handler.
@@ -90,8 +98,10 @@ impl Trojan {
         policy: &Policy,
     ) -> io::Result<()> {
         let users = self.users.clone();
-        let (dest, leftover) =
-            read_header(&mut conn, policy.handshake, 16384, move |b| parse(b, &users)).await?;
+        let (dest, leftover) = read_header(&mut conn, policy.handshake, 16384, move |b| {
+            parse(b, &users)
+        })
+        .await?;
         let timer = Timer::new(policy.idle);
         match dest.network {
             Network::Udp => {

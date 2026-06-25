@@ -73,10 +73,10 @@ impl Address {
         }
         // Strip brackets from `[::1]`-style inputs before the second attempt.
         let trimmed = s.strip_prefix('[').and_then(|t| t.strip_suffix(']'));
-        if let Some(inner) = trimmed {
-            if let Ok(ip) = inner.parse::<IpAddr>() {
-                return Address::Ip(ip);
-            }
+        if let Some(inner) = trimmed
+            && let Ok(ip) = inner.parse::<IpAddr>()
+        {
+            return Address::Ip(ip);
         }
         Address::Domain(CompactString::new(s))
     }
@@ -105,11 +105,19 @@ pub struct Destination {
 
 impl Destination {
     pub fn tcp(address: Address, port: u16) -> Destination {
-        Destination { network: Network::Tcp, address, port }
+        Destination {
+            network: Network::Tcp,
+            address,
+            port,
+        }
     }
 
     pub fn udp(address: Address, port: u16) -> Destination {
-        Destination { network: Network::Udp, address, port }
+        Destination {
+            network: Network::Udp,
+            address,
+            port,
+        }
     }
 
     pub fn is_valid(&self) -> bool {
@@ -127,7 +135,13 @@ impl Destination {
 
 impl fmt::Display for Destination {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}:{}", self.network.as_str(), self.address, self.port)
+        write!(
+            f,
+            "{}:{}:{}",
+            self.network.as_str(),
+            self.address,
+            self.port
+        )
     }
 }
 
@@ -206,14 +220,23 @@ pub struct AddrCodec {
 }
 
 impl AddrCodec {
-    pub const VLESS: AddrCodec =
-        AddrCodec { family: Family::VlessVmess, order: PortOrder::PortFirst, mask: false };
+    pub const VLESS: AddrCodec = AddrCodec {
+        family: Family::VlessVmess,
+        order: PortOrder::PortFirst,
+        mask: false,
+    };
     pub const VMESS: AddrCodec = AddrCodec::VLESS;
-    pub const TROJAN: AddrCodec =
-        AddrCodec { family: Family::Standard, order: PortOrder::PortLast, mask: false };
+    pub const TROJAN: AddrCodec = AddrCodec {
+        family: Family::Standard,
+        order: PortOrder::PortLast,
+        mask: false,
+    };
     pub const SOCKS: AddrCodec = AddrCodec::TROJAN;
-    pub const SHADOWSOCKS: AddrCodec =
-        AddrCodec { family: Family::Standard, order: PortOrder::PortLast, mask: true };
+    pub const SHADOWSOCKS: AddrCodec = AddrCodec {
+        family: Family::Standard,
+        order: PortOrder::PortLast,
+        mask: true,
+    };
 
     /// Decode an `(address, port)` pair from `buf`, advancing it.
     pub fn read(&self, buf: &mut Bytes) -> Result<(Address, u16)> {
@@ -269,12 +292,12 @@ impl AddrCodec {
                 let b = take(buf, len)?;
                 let domain = std::str::from_utf8(&b).map_err(|_| Error::BadDomain)?;
                 // First char looks like an IP? Try to parse it as one (Go parity).
-                if let Some(first) = domain.as_bytes().first() {
-                    if *first == b'[' || first.is_ascii_digit() {
-                        let parsed = Address::parse(domain);
-                        if parsed.is_ip() {
-                            return Ok(parsed);
-                        }
+                if let Some(first) = domain.as_bytes().first()
+                    && (*first == b'[' || first.is_ascii_digit())
+                {
+                    let parsed = Address::parse(domain);
+                    if parsed.is_ip() {
+                        return Ok(parsed);
                     }
                 }
                 if !is_valid_domain(domain) {
@@ -303,7 +326,10 @@ impl AddrCodec {
 
 pub fn read_port(buf: &mut Bytes) -> Result<u16> {
     if buf.remaining() < 2 {
-        return Err(Error::Truncated { needed: 2, had: buf.remaining() });
+        return Err(Error::Truncated {
+            needed: 2,
+            had: buf.remaining(),
+        });
     }
     Ok(buf.get_u16())
 }
@@ -311,7 +337,10 @@ pub fn read_port(buf: &mut Bytes) -> Result<u16> {
 /// Take one byte without panicking.
 pub fn take_u8(buf: &mut Bytes) -> Result<u8> {
     if buf.remaining() < 1 {
-        return Err(Error::Truncated { needed: 1, had: buf.remaining() });
+        return Err(Error::Truncated {
+            needed: 1,
+            had: buf.remaining(),
+        });
     }
     Ok(buf.get_u8())
 }
@@ -319,7 +348,10 @@ pub fn take_u8(buf: &mut Bytes) -> Result<u8> {
 /// Split off exactly `n` bytes or error.
 pub fn take(buf: &mut Bytes, n: usize) -> Result<Bytes> {
     if buf.remaining() < n {
-        return Err(Error::Truncated { needed: n, had: buf.remaining() });
+        return Err(Error::Truncated {
+            needed: n,
+            had: buf.remaining(),
+        });
     }
     Ok(buf.split_to(n))
 }

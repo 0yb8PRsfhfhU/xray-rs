@@ -15,7 +15,11 @@ pub struct SocketOpts {
 
 /// Bind a TCP listener with `SO_REUSEADDR` (+ optional `SO_REUSEPORT`/`SO_MARK`).
 pub fn bind_tcp(addr: SocketAddr, opts: &SocketOpts) -> io::Result<TcpListener> {
-    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     if opts.reuse_port {

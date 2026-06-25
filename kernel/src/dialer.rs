@@ -35,8 +35,7 @@ impl SystemDialer {
             }
             Address::Domain(d) => {
                 let ips = self.resolver.resolve(d).await?;
-                let mut last =
-                    io::Error::new(io::ErrorKind::NotFound, "no addresses for domain");
+                let mut last = io::Error::new(io::ErrorKind::NotFound, "no addresses for domain");
                 for ip in ips.iter() {
                     match TcpStream::connect(SocketAddr::new(*ip, dest.port)).await {
                         Ok(s) => {

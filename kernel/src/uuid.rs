@@ -18,7 +18,9 @@ impl Uuid {
     }
 
     pub fn from_bytes(b: &[u8]) -> Result<Uuid> {
-        let arr: [u8; 16] = b.try_into().map_err(|_| Error::Protocol("invalid UUID length"))?;
+        let arr: [u8; 16] = b
+            .try_into()
+            .map_err(|_| Error::Protocol("invalid UUID length"))?;
         Ok(Uuid(arr))
     }
 
@@ -28,7 +30,7 @@ impl Uuid {
     pub fn parse_str(s: &str) -> Result<Uuid> {
         let text = s.as_bytes();
         let l = text.len();
-        if l < 32 || l > 36 {
+        if !(32..=36).contains(&l) {
             if l == 0 || l > 30 {
                 return Err(Error::Protocol("invalid UUID"));
             }
@@ -53,7 +55,9 @@ impl Uuid {
             let hex = text.get(..group).ok_or(Error::Protocol("invalid UUID"))?;
             let nbytes = group / 2;
             let end = out_off.checked_add(nbytes).ok_or(Error::Overflow)?;
-            let dst = out.get_mut(out_off..end).ok_or(Error::Protocol("invalid UUID"))?;
+            let dst = out
+                .get_mut(out_off..end)
+                .ok_or(Error::Protocol("invalid UUID"))?;
             decode_hex(hex, dst)?;
             text = text.get(group..).unwrap_or(&[]);
             out_off = end;
@@ -66,8 +70,14 @@ fn decode_hex(hex: &[u8], dst: &mut [u8]) -> Result<()> {
     for (i, byte) in dst.iter_mut().enumerate() {
         let hi_idx = i.checked_mul(2).ok_or(Error::Overflow)?;
         let lo_idx = hi_idx.checked_add(1).ok_or(Error::Overflow)?;
-        let hi = hex.get(hi_idx).copied().ok_or(Error::Protocol("invalid UUID"))?;
-        let lo = hex.get(lo_idx).copied().ok_or(Error::Protocol("invalid UUID"))?;
+        let hi = hex
+            .get(hi_idx)
+            .copied()
+            .ok_or(Error::Protocol("invalid UUID"))?;
+        let lo = hex
+            .get(lo_idx)
+            .copied()
+            .ok_or(Error::Protocol("invalid UUID"))?;
         *byte = hex_val(hi)?.wrapping_shl(4) | hex_val(lo)?;
     }
     Ok(())
@@ -89,8 +99,22 @@ impl fmt::Display for Uuid {
         write!(
             f,
             "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[4],
+            b[5],
+            b[6],
+            b[7],
+            b[8],
+            b[9],
+            b[10],
+            b[11],
+            b[12],
+            b[13],
+            b[14],
+            b[15],
         )
     }
 }

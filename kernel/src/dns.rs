@@ -20,8 +20,9 @@ impl Resolver {
     /// Build a resolver from the system configuration, falling back to public
     /// resolvers when `/etc/resolv.conf` is unavailable.
     pub fn system() -> Resolver {
-        let inner = TokioAsyncResolver::tokio_from_system_conf()
-            .unwrap_or_else(|_| TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default()));
+        let inner = TokioAsyncResolver::tokio_from_system_conf().unwrap_or_else(|_| {
+            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
+        });
         Resolver::with_resolver(inner)
     }
 
@@ -48,10 +49,15 @@ impl Resolver {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
         let ips: Vec<IpAddr> = lookup.iter().collect();
         if ips.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no DNS records"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no DNS records",
+            ));
         }
         let arc: Arc<[IpAddr]> = Arc::from(ips);
-        self.cache.insert(CompactString::new(host), arc.clone()).await;
+        self.cache
+            .insert(CompactString::new(host), arc.clone())
+            .await;
         Ok(arc)
     }
 }

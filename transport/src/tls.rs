@@ -38,7 +38,9 @@ impl TlsServer {
         let pkey = cfg(PKey::private_key_from_pem(key_pem))?;
         let mut chain = cfg(X509::stack_from_pem(cert_pem))?;
         let mut iter = chain.drain(..);
-        let leaf = iter.next().ok_or_else(|| Error::Config("empty certificate".into()))?;
+        let leaf = iter
+            .next()
+            .ok_or_else(|| Error::Config("empty certificate".into()))?;
 
         let mut b = cfg(SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()))?;
         cfg(b.set_private_key(&pkey))?;
@@ -52,14 +54,19 @@ impl TlsServer {
                 select_next_proto(wire, client).ok_or(AlpnError::NOACK)
             });
         }
-        Ok(TlsServer { acceptor: b.build() })
+        Ok(TlsServer {
+            acceptor: b.build(),
+        })
     }
 
     /// Perform the TLS handshake over an accepted TCP stream.
     pub async fn accept(&self, tcp: TcpStream) -> std::io::Result<SslStream<TcpStream>> {
         let ssl = Ssl::new(self.acceptor.context()).map_err(std::io::Error::other)?;
         let mut stream = SslStream::new(ssl, tcp).map_err(std::io::Error::other)?;
-        Pin::new(&mut stream).accept().await.map_err(std::io::Error::other)?;
+        Pin::new(&mut stream)
+            .accept()
+            .await
+            .map_err(std::io::Error::other)?;
         Ok(stream)
     }
 }

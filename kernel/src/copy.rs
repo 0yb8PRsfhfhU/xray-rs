@@ -21,7 +21,11 @@ fn idle_err() -> io::Error {
 
 /// Pump `reader` → link `tx`, freezing each read into [`Bytes`] (SPEC §P3).
 /// Returns `Ok(())` on EOF; `tx` is dropped here, signalling EOF downstream.
-pub async fn conn_to_link<R>(mut reader: R, tx: mpsc::Sender<Bytes>, timer: &Timer) -> io::Result<()>
+pub async fn conn_to_link<R>(
+    mut reader: R,
+    tx: mpsc::Sender<Bytes>,
+    timer: &Timer,
+) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
 {
@@ -44,7 +48,11 @@ where
 }
 
 /// Pump link `rx` → `writer`. Returns `Ok(())` when the sender is dropped (EOF).
-pub async fn link_to_conn<W>(mut rx: mpsc::Receiver<Bytes>, mut writer: W, timer: &Timer) -> io::Result<()>
+pub async fn link_to_conn<W>(
+    mut rx: mpsc::Receiver<Bytes>,
+    mut writer: W,
+    timer: &Timer,
+) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -76,6 +84,9 @@ where
 {
     let (r, w) = tokio::io::split(conn);
     let Link { reader, writer } = link;
-    tokio::try_join!(conn_to_link(r, writer, timer), link_to_conn(reader, w, timer))?;
+    tokio::try_join!(
+        conn_to_link(r, writer, timer),
+        link_to_conn(reader, w, timer)
+    )?;
     Ok(())
 }

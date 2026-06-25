@@ -27,7 +27,12 @@ impl Dispatcher {
         default_tag: impl Into<CompactString>,
         router: Option<Router>,
     ) -> Dispatcher {
-        Dispatcher { dialer, outbounds, default_tag: default_tag.into(), router }
+        Dispatcher {
+            dialer,
+            outbounds,
+            default_tag: default_tag.into(),
+            router,
+        }
     }
 
     /// Convenience: a dispatcher with a single `freedom` outbound and no router.
@@ -51,10 +56,10 @@ impl Dispatcher {
                 sniffed_domain: sniffed,
                 protocol: None,
             };
-            if let Some(tag) = router.pick(&rc) {
-                if let Some(ob) = self.outbounds.get(tag) {
-                    return ob.clone();
-                }
+            if let Some(tag) = router.pick(&rc)
+                && let Some(ob) = self.outbounds.get(tag)
+            {
+                return ob.clone();
             }
         }
         self.outbounds
@@ -65,8 +70,19 @@ impl Dispatcher {
 
     /// Dispatch a TCP flow to `dest`; returns the inbound half of the pipe.
     pub fn dispatch_tcp(&self, ctx: &Ctx, dest: Destination, timer: Timer) -> Link {
+        self.dispatch_tcp_sniffed(ctx, dest, None, timer)
+    }
+
+    /// Dispatch a TCP flow with an optional sniffed domain used for routing.
+    pub fn dispatch_tcp_sniffed(
+        &self,
+        ctx: &Ctx,
+        dest: Destination,
+        sniffed: Option<&str>,
+        timer: Timer,
+    ) -> Link {
         let (inbound, outbound_half) = pipe(LINK_CAPACITY);
-        let ob = self.select(ctx, &dest, None);
+        let ob = self.select(ctx, &dest, sniffed);
         let dialer = self.dialer.clone();
         let id = ctx.id;
         tokio::spawn(async move {

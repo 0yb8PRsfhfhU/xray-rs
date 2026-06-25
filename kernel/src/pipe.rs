@@ -35,8 +35,14 @@ pub struct UdpLink {
 pub fn pipe(capacity: usize) -> (Link, Link) {
     let (up_tx, up_rx) = mpsc::channel(capacity);
     let (down_tx, down_rx) = mpsc::channel(capacity);
-    let inbound = Link { reader: down_rx, writer: up_tx };
-    let outbound = Link { reader: up_rx, writer: down_tx };
+    let inbound = Link {
+        reader: down_rx,
+        writer: up_tx,
+    };
+    let outbound = Link {
+        reader: up_rx,
+        writer: down_tx,
+    };
     (inbound, outbound)
 }
 
@@ -44,7 +50,13 @@ pub fn pipe(capacity: usize) -> (Link, Link) {
 pub fn udp_pipe(capacity: usize) -> (UdpLink, UdpLink) {
     let (up_tx, up_rx) = mpsc::channel(capacity);
     let (down_tx, down_rx) = mpsc::channel(capacity);
-    let inbound = UdpLink { reader: down_rx, writer: up_tx };
-    let outbound = UdpLink { reader: up_rx, writer: down_tx };
+    let inbound = UdpLink {
+        reader: down_rx,
+        writer: up_tx,
+    };
+    let outbound = UdpLink {
+        reader: up_rx,
+        writer: down_tx,
+    };
     (inbound, outbound)
 }

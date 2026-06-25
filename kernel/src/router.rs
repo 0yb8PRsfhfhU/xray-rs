@@ -40,7 +40,9 @@ impl DomainMatcher {
                 match domain.len().checked_sub(s.len()) {
                     Some(i) if i >= 1 => {
                         domain.as_bytes().get(i.wrapping_sub(1)) == Some(&b'.')
-                            && domain.get(i..).is_some_and(|tail| tail.eq_ignore_ascii_case(s))
+                            && domain
+                                .get(i..)
+                                .is_some_and(|tail| tail.eq_ignore_ascii_case(s))
                     }
                     _ => false,
                 }
@@ -128,13 +130,14 @@ impl Rule {
         if !self.networks.is_empty() && !self.networks.contains(&rc.network) {
             return false;
         }
-        if !self.inbound_tags.is_empty()
-            && !self.inbound_tags.iter().any(|t| t == rc.inbound_tag)
-        {
+        if !self.inbound_tags.is_empty() && !self.inbound_tags.iter().any(|t| t == rc.inbound_tag) {
             return false;
         }
         if !self.ports.is_empty()
-            && !self.ports.iter().any(|(lo, hi)| rc.target.port >= *lo && rc.target.port <= *hi)
+            && !self
+                .ports
+                .iter()
+                .any(|(lo, hi)| rc.target.port >= *lo && rc.target.port <= *hi)
         {
             return false;
         }
@@ -184,6 +187,9 @@ impl Router {
 
     /// Return the outbound tag for `rc`, or `None` to fall through to default.
     pub fn pick(&self, rc: &RouteCtx<'_>) -> Option<&str> {
-        self.rules.iter().find(|r| r.matches(rc)).map(|r| r.outbound_tag.as_str())
+        self.rules
+            .iter()
+            .find(|r| r.matches(rc))
+            .map(|r| r.outbound_tag.as_str())
     }
 }

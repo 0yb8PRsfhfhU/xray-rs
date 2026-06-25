@@ -16,7 +16,10 @@ pub struct Instance {
 
 impl Instance {
     pub fn new(built: Built) -> Instance {
-        Instance { built, policy: Policy::default() }
+        Instance {
+            built,
+            policy: Policy::default(),
+        }
     }
 
     /// Run all inbound listeners until the process exits.
@@ -42,13 +45,32 @@ async fn serve(ib: InboundInstance, disp: Arc<Dispatcher>, policy: Policy) -> Re
     let addr: SocketAddr = format!("{}:{}", ib.listen, ib.port)
         .parse()
         .with_context(|| format!("invalid listen address {}:{}", ib.listen, ib.port))?;
-    let listener = bind_tcp(addr, &SocketOpts::default())
-        .with_context(|| format!("binding {addr}"))?;
+    let listener =
+        bind_tcp(addr, &SocketOpts::default()).with_context(|| format!("binding {addr}"))?;
     tracing::info!(tag = %ib.tag, %addr, "listening");
 
     let handler = ib.handler;
     let stream_cfg = ib.stream;
     let tag = ib.tag;
+
+    if handler.binds_udp() {
+        match tokio::net::UdpSocket::bind(addr).await {
+            Ok(sock) => {
+                let sock = Arc::new(sock);
+                let uh = handler.clone();
+                let ud = disp.clone();
+                let utag = tag.clone();
+                tracing::info!(tag = %utag, %addr, "listening (udp)");
+                tokio::spawn(async move {
+                    let ctx = Ctx::new(utag, None);
+                    if let Err(e) = uh.serve_udp(sock, &ctx, &ud, &policy).await {
+                        tracing::debug!(error = %e, "udp listener ended");
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(%addr, error = %e, "udp bind failed"),
+        }
+    }
 
     loop {
         let (tcp, peer) = match listener.accept().await {

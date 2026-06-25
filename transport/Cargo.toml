@@ -18,6 +18,7 @@ openssl.workspace = true
 tokio-openssl.workspace = true
 tokio-tungstenite.workspace = true
 http.workspace = true
+h2.workspace = true
 base64.workspace = true
 sha1.workspace = true
 

@@ -1,0 +1,131 @@
+# xray-rs server — example configuration (custom TOML format).
+#
+# Run:  xray-rs config.toml
+# Log level via the file below or the RUST_LOG env var (e.g. RUST_LOG=info,proxy=debug).
+
+[log]
+level = "info"            # trace | debug | info | warn | error
+
+# ---------------------------------------------------------------------------
+# Inbounds. Each binds `listen:port`. `protocol` selects the decoder; `tls` and
+# `transport` are optional layers applied to every accepted connection.
+# ---------------------------------------------------------------------------
+
+# VLESS over TLS + WebSocket (flow=none; XTLS/REALITY are out of scope).
+[[inbound]]
+tag = "vless-ws-tls"
+listen = "0.0.0.0"
+port = 443
+protocol = "vless"
+  [[inbound.users]]
+  uuid = "338379b1-f342-496c-9a91-8dd4a6d8b511"   # or any short string (SHA1-derived)
+  email = "alice@example.com"
+  level = 0
+  [inbound.tls]
+  cert = "/etc/xray-rs/cert.pem"                  # PEM cert chain
+  key = "/etc/xray-rs/key.pem"                    # PEM private key
+  alpn = ["h2", "http/1.1"]                       # optional; default ["h2","http/1.1"]
+  [inbound.transport]
+  type = "ws"                                      # tcp | ws | httpupgrade | grpc
+  path = "/wspath"
+  # host = "example.com"                           # optional Host validation
+
+# Trojan over TLS.
+[[inbound]]
+tag = "trojan"
+listen = "0.0.0.0"
+port = 8443
+protocol = "trojan"
+  [[inbound.users]]
+  password = "trojan-secret"
+  [inbound.tls]
+  cert = "/etc/xray-rs/cert.pem"
+  key = "/etc/xray-rs/key.pem"
+
+# Shadowsocks AEAD (self-contained crypto; also binds UDP on the same port).
+[[inbound]]
+tag = "ss"
+listen = "0.0.0.0"
+port = 8388
+protocol = "shadowsocks"
+method = "aes-256-gcm"     # aes-128-gcm | aes-256-gcm | chacha20-ietf-poly1305 | xchacha20-ietf-poly1305
+  [[inbound.users]]
+  password = "ss-secret"
+
+# VMess (AEAD header; auto/aes-128-gcm/chacha20-poly1305 body; UDP via XUDP/mux).
+[[inbound]]
+tag = "vmess"
+listen = "0.0.0.0"
+port = 8445
+protocol = "vmess"
+  [[inbound.users]]
+  uuid = "338379b1-f342-496c-9a91-8dd4a6d8b511"
+
+# VLESS over gRPC + TLS.
+[[inbound]]
+tag = "vless-grpc"
+listen = "0.0.0.0"
+port = 2053
+protocol = "vless"
+  [[inbound.users]]
+  uuid = "338379b1-f342-496c-9a91-8dd4a6d8b511"
+  [inbound.tls]
+  cert = "/etc/xray-rs/cert.pem"
+  key = "/etc/xray-rs/key.pem"
+  alpn = ["h2"]
+  [inbound.transport]
+  type = "grpc"
+  service_name = "GunService"
+
+# Plain SOCKS5 (optional user/pass; supports UDP ASSOCIATE).
+[[inbound]]
+tag = "socks"
+listen = "127.0.0.1"
+port = 1080
+protocol = "socks"
+  # [[inbound.users]]            # omit for no-auth
+  # username = "u"
+  # password = "p"
+
+# Plain HTTP proxy (CONNECT + absolute-form; optional Basic auth).
+[[inbound]]
+tag = "http"
+listen = "127.0.0.1"
+port = 8080
+protocol = "http"
+
+# dokodemo-door: relay everything to a fixed target (transparent sink).
+[[inbound]]
+tag = "dns-in"
+listen = "127.0.0.1"
+port = 5300
+protocol = "dokodemo-door"
+target_address = "1.1.1.1"
+target_port = 53
+
+# ---------------------------------------------------------------------------
+# Outbounds. First entry is the default. `freedom` dials directly; `blackhole`
+# drops traffic.
+# ---------------------------------------------------------------------------
+
+[[outbound]]
+tag = "direct"
+protocol = "freedom"
+
+[[outbound]]
+tag = "block"
+protocol = "blackhole"
+
+# ---------------------------------------------------------------------------
+# Routing. First matching rule wins; unmatched flows use the default outbound.
+# A rule matches when every populated dimension matches (OR within each list).
+# Domains use `full:` / `suffix:` (alias `domain:`) / `keyword:` prefixes.
+# ---------------------------------------------------------------------------
+
+[[route]]
+outbound = "block"
+domain = ["suffix:doubleclick.net", "keyword:ads"]
+
+[[route]]
+outbound = "block"
+ip = ["10.0.0.0/8", "192.168.0.0/16"]
