@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = ["kernel", "proxy", "transport"]
+
+[workspace.dependencies]
+tokio = {
+    version = "1.52",
+    features = ["rt-multi-thread"]
+}
