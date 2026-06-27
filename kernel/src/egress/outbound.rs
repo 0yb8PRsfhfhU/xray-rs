@@ -11,28 +11,22 @@ use crate::types::net::{Address, Destination};
 use crate::pipe_asm::pipe::{Link, UdpLink, UdpPacket};
 use crate::pipe_asm::timer::Timer;
 
-/// Direct outbound: dial the real target and forward bytes.
-#[derive(Debug, Clone, Default)]
-pub struct Freedom;
-
-/// Drop everything (used to block routed traffic).
-#[derive(Debug, Clone, Default)]
-pub struct Blackhole;
-
 /// Closed sum of server outbounds.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Outbound {
-    Freedom(Freedom),
-    Blackhole(Blackhole),
+    /// Direct outbound: dial the real target and forward bytes.
+    Freedom,
+    /// Drop everything (used to block routed traffic).
+    Blackhole,
 }
 
 impl Outbound {
     pub fn freedom() -> Outbound {
-        Outbound::Freedom(Freedom)
+        Outbound::Freedom
     }
 
     pub fn blackhole() -> Outbound {
-        Outbound::Blackhole(Blackhole)
+        Outbound::Blackhole
     }
 
     /// Handle a TCP flow to `dest`, pumping bytes between the link and target.
@@ -44,11 +38,11 @@ impl Outbound {
         timer: &Timer,
     ) -> io::Result<()> {
         match self {
-            Outbound::Freedom(_) => {
+            Outbound::Freedom => {
                 let stream = dialer.dial_tcp(&dest).await?;
                 splice(stream, link, timer).await
             }
-            Outbound::Blackhole(_) => {
+            Outbound::Blackhole => {
                 drop(link);
                 Ok(())
             }
@@ -63,8 +57,8 @@ impl Outbound {
         timer: &Timer,
     ) -> io::Result<()> {
         match self {
-            Outbound::Freedom(_) => freedom_udp(dialer, link, timer).await,
-            Outbound::Blackhole(_) => {
+            Outbound::Freedom => freedom_udp(dialer, link, timer).await,
+            Outbound::Blackhole => {
                 drop(link);
                 Ok(())
             }
@@ -85,7 +79,7 @@ async fn freedom_udp(dialer: &SystemDialer, link: UdpLink, timer: &Timer) -> io:
             let addr = dialer.resolve_addr(&pkt.target).await?;
             send_sock.send_to(&pkt.data, addr).await?;
         }
-        io::Result::Ok(())
+        Ok(())
     };
 
     let recv = async move {
@@ -97,7 +91,7 @@ async fn freedom_udp(dialer: &SystemDialer, link: UdpLink, timer: &Timer) -> io:
             let data = Bytes::copy_from_slice(slice);
             let target = Destination::udp(Address::Ip(from.ip()), from.port());
             if writer.send(UdpPacket { data, target }).await.is_err() {
-                return io::Result::Ok(());
+                return Ok(());
             }
         }
     };
