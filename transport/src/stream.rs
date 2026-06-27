@@ -16,56 +16,56 @@ use crate::grpc::GrpcStream;
 use crate::ws::WsStream;
 
 /// The transport-security layer.
-pub enum Raw {
+pub enum RawNetworkStream {
     Tcp(TcpStream),
     Tls(Box<SslStream<TcpStream>>),
 }
 
-impl AsyncRead for Raw {
+impl AsyncRead for RawNetworkStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Raw::Tcp(s) => Pin::new(s).poll_read(cx, buf),
-            Raw::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            RawNetworkStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            RawNetworkStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
 
-impl AsyncWrite for Raw {
+impl AsyncWrite for RawNetworkStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
-            Raw::Tcp(s) => Pin::new(s).poll_write(cx, buf),
-            Raw::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            RawNetworkStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            RawNetworkStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Raw::Tcp(s) => Pin::new(s).poll_flush(cx),
-            Raw::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            RawNetworkStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            RawNetworkStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Raw::Tcp(s) => Pin::new(s).poll_shutdown(cx),
-            Raw::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            RawNetworkStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            RawNetworkStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
 
 /// A fully composed inbound connection.
 pub enum Stream {
-    Raw(Raw),
-    Ws(Box<WsStream<Raw>>),
-    Grpc(Box<GrpcStream<Raw>>),
+    Raw(RawNetworkStream),
+    Ws(Box<WsStream<RawNetworkStream>>),
+    Grpc(Box<GrpcStream<RawNetworkStream>>),
 }
 
 impl AsyncRead for Stream {
@@ -112,8 +112,20 @@ impl AsyncWrite for Stream {
     }
 }
 
-impl From<Raw> for Stream {
-    fn from(r: Raw) -> Stream {
+impl From<RawNetworkStream> for Stream {
+    fn from(r: RawNetworkStream) -> Stream {
         Stream::Raw(r)
+    }
+}
+
+impl From<TcpStream> for Stream {
+    fn from(t: TcpStream) -> Stream {
+        Stream::Raw(RawNetworkStream::Tcp(t))
+    }
+}
+
+impl From<SslStream<TcpStream>> for Stream {
+    fn from(s: SslStream<TcpStream>) -> Stream {
+        Stream::Raw(RawNetworkStream::Tls(Box::new(s)))
     }
 }

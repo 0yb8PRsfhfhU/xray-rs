@@ -4,8 +4,8 @@
 
 use std::io;
 
+use crate::{Transport, stream::RawNetworkStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use crate::{Raw, Transport};
 
 /// Server httpupgrade settings.
 #[derive(Debug, Clone, Default)]
@@ -15,8 +15,8 @@ pub struct HttpUpgradeConfig {
 }
 
 impl Transport for HttpUpgradeConfig {
-    type Stream = Raw;
-    async fn accept(&self, stream: Raw) -> io::Result<Raw> {
+    type Stream = RawNetworkStream;
+    async fn accept(&self, stream: RawNetworkStream) -> io::Result<RawNetworkStream> {
         accept(stream, self).await
     }
 }

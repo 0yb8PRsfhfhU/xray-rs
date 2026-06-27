@@ -28,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::oneshot;
 
 use crate::Transport;
-use crate::stream::Raw;
+use crate::stream::RawNetworkStream;
 
 /// Reject any single gRPC message claiming more than this many bytes. Real
 /// xray peers frame small buffers (bounded by the HTTP/2 flow-control window);
@@ -44,8 +44,8 @@ pub struct GrpcConfig {
 }
 
 impl Transport for GrpcConfig {
-    type Stream = GrpcStream<Raw>;
-    async fn accept(&self, stream: Raw) -> io::Result<GrpcStream<Raw>> {
+    type Stream = GrpcStream<RawNetworkStream>;
+    async fn accept(&self, stream: RawNetworkStream) -> io::Result<GrpcStream<RawNetworkStream>> {
         accept(stream, self).await
     }
 }
@@ -53,7 +53,10 @@ impl Transport for GrpcConfig {
 /// Perform the server-side gRPC (HTTP/2) handshake over `raw`, accept the
 /// `Tun` stream, send the `200 application/grpc` response head, and return a
 /// byte-stream adapter over the tunnel.
-pub async fn accept(raw: Raw, cfg: &GrpcConfig) -> io::Result<GrpcStream<Raw>> {
+pub async fn accept(
+    raw: RawNetworkStream,
+    cfg: &GrpcConfig,
+) -> io::Result<GrpcStream<RawNetworkStream>> {
     let mut conn = server::handshake(raw).await.map_err(io::Error::other)?;
 
     let (request, mut respond) = match conn.accept().await {
@@ -437,7 +440,7 @@ mod tests {
     #[test]
     fn assert_send_unpin() {
         fn check<T: Send + Unpin>() {}
-        check::<GrpcStream<Raw>>();
+        check::<GrpcStream<RawNetworkStream>>();
     }
 
     #[test]
@@ -530,7 +533,7 @@ mod tests {
             let cfg = GrpcConfig {
                 service_name: "GunService".into(),
             };
-            let mut stream = accept(Raw::Tcp(sock), &cfg).await.unwrap();
+            let mut stream = accept(RawNetworkStream::Tcp(sock), &cfg).await.unwrap();
             let mut buf = [0u8; 64];
             let n = stream.read(&mut buf).await.unwrap();
             stream.write_all(&buf[..n]).await.unwrap();

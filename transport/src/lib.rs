@@ -20,15 +20,14 @@ pub mod tls;
 pub mod ws;
 
 use std::sync::Arc;
-
 use tokio::net::TcpStream;
 
-pub use grpc::GrpcConfig;
 pub use httpupgrade::HttpUpgradeConfig;
 pub use listener::{SocketOpts, bind_tcp};
-pub use stream::{Raw, Stream};
+pub use stream::Stream;
 pub use tls::TlsServer;
 pub use ws::{WsConfig, WsStream};
+pub use grpc::GrpcConfig;
 
 /// Transport-security layer for an inbound listener.
 #[derive(Clone)]
@@ -43,14 +42,14 @@ pub enum TransportKind {
     Raw,
     Ws(Arc<WsConfig>),
     HttpUpgrade(Arc<HttpUpgradeConfig>),
-    Grpc(Arc<grpc::GrpcConfig>),
+    Grpc(Arc<GrpcConfig>),
 }
 
 pub trait Transport {
     type Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static;
     fn accept(
         &self,
-        stream: crate::stream::Raw,
+        stream: stream::RawNetworkStream,
     ) -> impl Future<Output = std::io::Result<Self::Stream>> + Send;
 }
 
@@ -72,7 +71,7 @@ impl StreamConfig {
 
 impl Transport for TransportKind {
     type Stream = Stream;
-    async fn accept(&self, raw: crate::stream::Raw) -> std::io::Result<Stream> {
+    async fn accept(&self, raw: stream::RawNetworkStream) -> std::io::Result<Stream> {
         match self {
             TransportKind::Raw => Ok(Stream::Raw(raw)),
             TransportKind::Ws(cfg) => {
@@ -95,8 +94,8 @@ impl Transport for TransportKind {
 /// composed [`Stream`] handed to an inbound handler.
 pub async fn accept_stream(tcp: TcpStream, cfg: &StreamConfig) -> std::io::Result<Stream> {
     let raw = match &cfg.security {
-        Security::None => Raw::Tcp(tcp),
-        Security::Tls(server) => Raw::Tls(Box::new(server.accept(tcp).await?)),
+        Security::None => stream::RawNetworkStream::Tcp(tcp),
+        Security::Tls(server) => stream::RawNetworkStream::Tls(Box::new(server.accept(tcp).await?)),
     };
     cfg.transport.accept(raw).await
 }

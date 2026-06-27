@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 
+use crate::{Transport, stream::RawNetworkStream};
 use base64::Engine;
 use bytes::Bytes;
 use futures::sink::Sink;
@@ -15,7 +16,6 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use crate::{Raw, Transport};
 
 /// Server websocket transport settings.
 #[derive(Debug, Clone, Default)]
@@ -25,8 +25,8 @@ pub struct WsConfig {
 }
 
 impl Transport for WsConfig {
-    type Stream = WsStream<Raw>;
-    async fn accept(&self, stream: Raw) -> io::Result<WsStream<Raw>> {
+    type Stream = WsStream<RawNetworkStream>;
+    async fn accept(&self, stream: RawNetworkStream) -> io::Result<WsStream<RawNetworkStream>> {
         accept(stream, self).await
     }
 }
