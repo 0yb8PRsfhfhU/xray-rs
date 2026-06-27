@@ -133,7 +133,7 @@ impl Shadowsocks {
 
         // Server response salt + downlink cipher.
         let mut ssalt = vec![0u8; ksize];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut ssalt);
+        rand::fill(&mut ssalt);
         conn.write_all(&ssalt).await?;
         let mut dsub = vec![0u8; ksize];
         hkdf_sha1(&user.master, &ssalt, SUBKEY_INFO, &mut dsub).map_err(io::Error::other)?;
@@ -253,7 +253,7 @@ fn ss_udp_encode(
     let ksize = kind.key_size();
     let nsize = kind.nonce_size();
     let mut salt = vec![0u8; ksize];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
+    rand::fill(&mut salt);
     let mut subkey = vec![0u8; ksize];
     hkdf_sha1(master, &salt, SUBKEY_INFO, &mut subkey).ok()?;
     let aead = Aead::new(kind, &subkey).ok()?;

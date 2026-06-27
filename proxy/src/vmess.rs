@@ -409,7 +409,7 @@ where
         out.extend_from_slice(&ct);
         if padding > 0 {
             let mut pad = vec![0u8; padding];
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut pad);
+            rand::fill(&mut pad);
             out.extend_from_slice(&pad);
         }
         w.write_all(&out).await?;
@@ -449,7 +449,7 @@ where
     out.extend_from_slice(&ct);
     if padding > 0 {
         let mut pad = vec![0u8; padding];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut pad);
+        rand::fill(&mut pad);
         out.extend_from_slice(&pad);
     }
     w.write_all(&out).await?;

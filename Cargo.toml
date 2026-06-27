@@ -20,7 +20,7 @@ futures = "0.3"
 bytes = "1"
 
 # data values
-compact_str = "0.8"
+compact_str = "0.9"
 smallvec = "1.15"
 arc-swap = "1"
 moka = { version = "0.12", features = ["future"] }
@@ -28,7 +28,7 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rand = "0.8"
+rand = "0.10"
 
 # tls (OpenSSL per objective, not rustls)
 openssl = "0.10"
