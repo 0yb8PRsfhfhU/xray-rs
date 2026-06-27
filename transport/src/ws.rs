@@ -169,7 +169,7 @@ where
     ) -> Poll<io::Result<usize>> {
         let me = self.get_mut();
         ready!(Pin::new(&mut me.inner).poll_ready(cx)).map_err(io::Error::other)?;
-        let msg = Message::Binary(buf.to_vec());
+        let msg = Message::Binary(Bytes::copy_from_slice(buf));
         Pin::new(&mut me.inner)
             .start_send(msg)
             .map_err(io::Error::other)?;

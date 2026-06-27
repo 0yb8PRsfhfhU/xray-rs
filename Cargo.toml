@@ -35,7 +35,7 @@ openssl = "0.10"
 tokio-openssl = "0.6"
 
 # transports
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http = "1"
