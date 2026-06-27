@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use compact_str::CompactString;
 
-use crate::error::{Error, Result};
+use crate::types::error::{Error, Result};
 
 /// Transport network. Discriminants match the Go protobuf enum (no value `1`).
 #[repr(u8)]

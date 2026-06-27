@@ -15,7 +15,7 @@ use std::io;
 use base64::Engine;
 use bytes::{BufMut, Bytes, BytesMut};
 
-use kernel::error::Error;
+use kernel::types::error::Error;
 use kernel::{Address, Ctx, Destination, Dispatcher, Policy, Timer};
 use tokio::io::AsyncWriteExt;
 use transport::Stream;

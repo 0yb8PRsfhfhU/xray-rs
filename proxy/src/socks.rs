@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use kernel::net::AddrCodec;
+use kernel::types::net::AddrCodec;
 use kernel::{Address, Ctx, Destination, Dispatcher, Policy, Timer, UdpLink, UdpPacket};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;

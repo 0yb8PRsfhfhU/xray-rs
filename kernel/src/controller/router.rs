@@ -8,7 +8,7 @@ use std::net::IpAddr;
 
 use compact_str::CompactString;
 
-use crate::net::{Address, Destination, Network};
+use crate::types::net::{Address, Destination, Network};
 
 /// Context evaluated against routing rules for one flow.
 pub struct RouteCtx<'a> {

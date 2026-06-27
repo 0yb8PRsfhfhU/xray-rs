@@ -14,31 +14,21 @@
     clippy::arithmetic_side_effects
 )]
 
-pub mod copy;
-pub mod dialer;
-pub mod dispatcher;
-pub mod dns;
-pub mod error;
-pub mod net;
-pub mod outbound;
-pub mod pipe;
-pub mod policy;
-pub mod router;
-pub mod session;
-pub mod sniff;
-pub mod timer;
-pub mod uuid;
+pub mod types;
+pub mod pipe_asm;
+pub mod egress;
+pub mod controller;
 
-pub use dialer::SystemDialer;
-pub use dispatcher::Dispatcher;
-pub use dns::Resolver;
-pub use error::{Error, Result};
-pub use net::{AddrCodec, Address, Destination, Family, Network, PortOrder};
-pub use outbound::Outbound;
-pub use pipe::{Link, UdpLink, UdpPacket};
-pub use policy::Policy;
-pub use router::{Cidr, DomainMatcher, RouteCtx, Router, Rule};
-pub use session::Ctx;
-pub use sniff::{SniffedProtocol, sniff, sniff_http, sniff_tls};
-pub use timer::Timer;
-pub use uuid::Uuid;
+pub use egress::dialer::SystemDialer;
+pub use controller::dispatcher::Dispatcher;
+pub use egress::dns::Resolver;
+pub use types::error::{Error, Result};
+pub use types::net::{AddrCodec, Address, Destination, Family, Network, PortOrder};
+pub use egress::outbound::Outbound;
+pub use pipe_asm::pipe::{Link, UdpLink, UdpPacket};
+pub use controller::policy::Policy;
+pub use controller::router::{Cidr, DomainMatcher, RouteCtx, Router, Rule};
+pub use controller::session::Ctx;
+pub use controller::sniff::{sniff, sniff_http, sniff_tls, SniffedProtocol};
+pub use pipe_asm::timer::Timer;
+pub use types::uuid::Uuid;

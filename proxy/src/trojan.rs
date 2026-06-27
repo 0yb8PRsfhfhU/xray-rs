@@ -9,8 +9,8 @@ use bytes::Bytes;
 use compact_str::CompactString;
 use sha2::{Digest, Sha224};
 
-use kernel::error::Error;
-use kernel::net::{self, AddrCodec};
+use kernel::types::error::Error;
+use kernel::types::net::{self, AddrCodec};
 use kernel::{Ctx, Destination, Dispatcher, Network, Policy, Timer};
 use transport::Stream;
 

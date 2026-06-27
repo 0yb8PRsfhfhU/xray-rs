@@ -11,8 +11,8 @@ use bytes::Bytes;
 use compact_str::CompactString;
 use tokio::io::AsyncWriteExt;
 
-use kernel::error::Error;
-use kernel::net::{self, AddrCodec};
+use kernel::types::error::Error;
+use kernel::types::net::{self, AddrCodec};
 use kernel::{Ctx, Destination, Dispatcher, Policy, Timer, Uuid};
 use transport::Stream;
 

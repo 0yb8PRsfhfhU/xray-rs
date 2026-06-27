@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::net::Destination;
+use crate::types::net::Destination;
 
 /// Default number of in-flight chunks per direction (~backpressure window).
 pub const LINK_CAPACITY: usize = 32;

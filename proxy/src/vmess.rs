@@ -22,8 +22,8 @@ use sha3::Shake128;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-use kernel::error::Error;
-use kernel::net::{self, AddrCodec};
+use kernel::types::error::Error;
+use kernel::types::net::{self, AddrCodec};
 use kernel::{Ctx, Destination, Dispatcher, Network, Policy, Timer, Uuid};
 use transport::Stream;
 

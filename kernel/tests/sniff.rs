@@ -2,7 +2,7 @@
 //! `Xray-core/common/protocol/http/sniff_test.go`.
 #![allow(clippy::indexing_slicing)]
 
-use kernel::sniff::{SniffedProtocol, sniff, sniff_http, sniff_tls};
+use kernel::controller::sniff::{SniffedProtocol, sniff, sniff_http, sniff_tls};
 
 #[test]
 fn tls_headers() {

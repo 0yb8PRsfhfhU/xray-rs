@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use tokio::net::{TcpStream, UdpSocket};
 
-use crate::dns::Resolver;
-use crate::net::{Address, Destination};
+use crate::egress::dns::Resolver;
+use crate::types::net::{Address, Destination};
 
 /// Dials real destinations directly, resolving domains through the shared
 /// cached [`Resolver`] (SPEC §P4).

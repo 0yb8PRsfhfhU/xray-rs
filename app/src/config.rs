@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use compact_str::CompactString;
 use serde::Deserialize;
 
-use kernel::router::{Cidr, DomainMatcher, Router, Rule};
+use kernel::controller::router::{Cidr, DomainMatcher, Router, Rule};
 use kernel::{Dispatcher, Network, Outbound, Resolver, SystemDialer};
 use proxy::{
     Dokodemo, Http, HttpAccount, Inbound, Shadowsocks, Socks, SocksAccount, Trojan, TrojanUsers,

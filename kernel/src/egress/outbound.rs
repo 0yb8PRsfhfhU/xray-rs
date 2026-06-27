@@ -5,11 +5,11 @@ use std::io;
 
 use bytes::Bytes;
 
-use crate::copy::splice;
-use crate::dialer::SystemDialer;
-use crate::net::{Address, Destination};
-use crate::pipe::{Link, UdpLink, UdpPacket};
-use crate::timer::Timer;
+use crate::pipe_asm::copy::splice;
+use crate::egress::dialer::SystemDialer;
+use crate::types::net::{Address, Destination};
+use crate::pipe_asm::pipe::{Link, UdpLink, UdpPacket};
+use crate::pipe_asm::timer::Timer;
 
 /// Direct outbound: dial the real target and forward bytes.
 #[derive(Debug, Clone, Default)]

@@ -4,13 +4,13 @@ use std::collections::HashMap;
 
 use compact_str::CompactString;
 
-use crate::dialer::SystemDialer;
-use crate::net::Destination;
-use crate::outbound::Outbound;
-use crate::pipe::{LINK_CAPACITY, Link, UdpLink, pipe, udp_pipe};
-use crate::router::{RouteCtx, Router};
-use crate::session::Ctx;
-use crate::timer::Timer;
+use crate::egress::dialer::SystemDialer;
+use crate::types::net::Destination;
+use crate::egress::outbound::Outbound;
+use crate::pipe_asm::pipe::{LINK_CAPACITY, Link, UdpLink, pipe, udp_pipe};
+use crate::controller::router::{RouteCtx, Router};
+use crate::controller::session::Ctx;
+use crate::pipe_asm::timer::Timer;
 
 /// Owns the outbound set + router and wires inbound flows to outbounds.
 pub struct Dispatcher {

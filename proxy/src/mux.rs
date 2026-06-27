@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io;
 
 use bytes::{Bytes, BytesMut};
-use kernel::net::AddrCodec;
+use kernel::types::net::AddrCodec;
 use kernel::{Ctx, Destination, Dispatcher, Network, Policy, Timer, UdpLink, UdpPacket};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;

@@ -8,7 +8,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::time::timeout;
 
-use kernel::error::Error;
+use kernel::types::error::Error;
 use kernel::{Ctx, Destination, Dispatcher, Timer};
 
 /// Read and parse a protocol header off `conn` under a handshake deadline.
@@ -78,7 +78,7 @@ where
     let sniffed = if leftover.is_empty() {
         None
     } else {
-        kernel::sniff::sniff(&leftover).map(|(_, domain)| domain)
+        kernel::controller::sniff::sniff(&leftover).map(|(_, domain)| domain)
     };
     let link = disp.dispatch_tcp_sniffed(ctx, dest, sniffed.as_deref(), timer.clone());
     if !leftover.is_empty() {
@@ -87,5 +87,5 @@ where
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "outbound closed"))?;
     }
-    kernel::copy::splice(conn, link, &timer).await
+    kernel::pipe_asm::copy::splice(conn, link, &timer).await
 }

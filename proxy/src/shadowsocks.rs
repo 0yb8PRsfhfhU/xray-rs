@@ -14,7 +14,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use kernel::net::AddrCodec;
+use kernel::types::net::AddrCodec;
 use kernel::{Ctx, Destination, Dispatcher, Policy, Timer, UdpLink, UdpPacket};
 use transport::Stream;
 

@@ -9,8 +9,8 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::pipe::Link;
-use crate::timer::Timer;
+use crate::pipe_asm::pipe::Link;
+use crate::pipe_asm::timer::Timer;
 
 /// Read window size handed to a single `read` (SPEC §2a, 8–64 KiB band).
 pub const READ_BUF: usize = 16384;
