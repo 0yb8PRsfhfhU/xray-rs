@@ -1,9 +1,9 @@
 //! The system dialer: direct `connect`/`bind` to real targets (SPEC §2a).
 
+use smallvec::SmallVec;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::egress::dns::Resolver;
@@ -42,9 +42,9 @@ impl SystemDialer {
     }
 
     /// Resolve `dest` to a single socket address (first IP).
-    pub async fn resolve_addr(&self, dest: &Destination) -> io::Result<Vec<SocketAddr>> {
+    pub async fn resolve_addr(&self, dest: &Destination) -> io::Result<SmallVec<[SocketAddr; 3]>> {
         match &dest.address {
-            Address::Ip(ip) => Ok(vec![SocketAddr::new(*ip, dest.port)]),
+            Address::Ip(ip) => Ok(smallvec::smallvec![SocketAddr::new(*ip, dest.port)]),
             Address::Domain(d) => {
                 let ips = self.resolver.resolve(d).await?;
                 let socket_addrs = ips
