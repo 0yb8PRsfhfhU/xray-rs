@@ -14,6 +14,7 @@ use kernel::types::net::{self, AddrCodec};
 use kernel::{Ctx, Destination, Dispatcher, Network, Policy, Timer};
 use transport::Stream;
 
+use crate::ProxyInbound;
 use crate::io::{read_header, relay_tcp};
 
 const CMD_UDP: u8 = 3;
@@ -89,8 +90,10 @@ impl Trojan {
     pub fn new(users: Arc<TrojanUsers>) -> Trojan {
         Trojan { users }
     }
+}
 
-    pub async fn process(
+impl ProxyInbound for Trojan {
+    async fn serve(
         &self,
         ctx: &Ctx,
         mut conn: Stream,

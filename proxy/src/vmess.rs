@@ -27,6 +27,7 @@ use kernel::types::net::{self, AddrCodec};
 use kernel::{Ctx, Destination, Dispatcher, Network, Policy, Timer, Uuid};
 use transport::Stream;
 
+use crate::ProxyInbound;
 use crate::crypto::{Aead, AeadKind};
 
 const MAGIC: &[u8] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
@@ -653,6 +654,18 @@ impl Vmess {
         let header = aes128gcm_open(&pay_key, pay_iv.get(..12).unwrap_or(&[]), &payct, &authid)?;
 
         parse_header(&header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
+impl ProxyInbound for Vmess {
+    async fn serve(
+        &self,
+        ctx: &Ctx,
+        conn: Stream,
+        disp: &Dispatcher,
+        policy: &Policy,
+    ) -> io::Result<()> {
+        Vmess::process(self, ctx, conn, disp, policy).await
     }
 }
 

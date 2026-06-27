@@ -24,6 +24,7 @@ pub mod udp;
 pub mod vless;
 pub mod vmess;
 
+use std::future::Future;
 use std::io as stdio;
 use std::sync::Arc;
 
@@ -50,9 +51,29 @@ pub enum Inbound {
     Vmess(Vmess),
 }
 
-impl Inbound {
+pub trait ProxyInbound {
     /// Decode the proxy header, authenticate, and run the flow to completion.
-    pub async fn process(
+    fn serve(
+        &self,
+        ctx: &Ctx,
+        conn: Stream,
+        disp: &Dispatcher,
+        policy: &Policy,
+    ) -> impl Future<Output = stdio::Result<()>> + Send;
+}
+
+pub trait UdpProxyInbound {
+    fn serve_udp(
+        &self,
+        socket: Arc<UdpSocket>,
+        ctx: &Ctx,
+        disp: &Dispatcher,
+        policy: &Policy,
+    ) -> impl Future<Output = stdio::Result<()>> + Send;
+}
+
+impl ProxyInbound for Inbound {
+    async fn serve(
         &self,
         ctx: &Ctx,
         conn: Stream,
@@ -60,16 +81,18 @@ impl Inbound {
         policy: &Policy,
     ) -> stdio::Result<()> {
         match self {
-            Inbound::Trojan(h) => h.process(ctx, conn, disp, policy).await,
-            Inbound::Vless(h) => h.process(ctx, conn, disp, policy).await,
-            Inbound::Shadowsocks(h) => h.process(ctx, conn, disp, policy).await,
-            Inbound::Socks(h) => h.process(ctx, conn, disp, policy).await,
-            Inbound::Http(h) => h.process(ctx, conn, disp, policy).await,
-            Inbound::Dokodemo(h) => h.process(ctx, conn, disp, policy).await,
-            Inbound::Vmess(h) => h.process(ctx, conn, disp, policy).await,
+            Inbound::Trojan(h) => h.serve(ctx, conn, disp, policy).await,
+            Inbound::Vless(h) => h.serve(ctx, conn, disp, policy).await,
+            Inbound::Shadowsocks(h) => h.serve(ctx, conn, disp, policy).await,
+            Inbound::Socks(h) => h.serve(ctx, conn, disp, policy).await,
+            Inbound::Http(h) => h.serve(ctx, conn, disp, policy).await,
+            Inbound::Dokodemo(h) => h.serve(ctx, conn, disp, policy).await,
+            Inbound::Vmess(h) => h.serve(ctx, conn, disp, policy).await,
         }
     }
+}
 
+impl Inbound {
     /// Whether this inbound also binds a UDP socket on its port.
     pub fn binds_udp(&self) -> bool {
         matches!(self, Inbound::Shadowsocks(_))

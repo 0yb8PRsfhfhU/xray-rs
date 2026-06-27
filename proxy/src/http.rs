@@ -20,6 +20,7 @@ use kernel::{Address, Ctx, Destination, Dispatcher, Policy, Timer};
 use tokio::io::AsyncWriteExt;
 use transport::Stream;
 
+use crate::ProxyInbound;
 use crate::io::{read_header, relay_tcp};
 
 /// Maximum request-head size we will buffer before giving up (~16 KiB).
@@ -279,4 +280,16 @@ fn parse_authority(s: &str, default_port: u16) -> io::Result<(Address, u16)> {
 
 fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+impl ProxyInbound for Http {
+    async fn serve(
+        &self,
+        ctx: &Ctx,
+        conn: Stream,
+        disp: &Dispatcher,
+        policy: &Policy,
+    ) -> io::Result<()> {
+        Http::process(self, ctx, conn, disp, policy).await
+    }
 }

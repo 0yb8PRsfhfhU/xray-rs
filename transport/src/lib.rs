@@ -22,12 +22,12 @@ pub mod ws;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 
+pub use grpc::GrpcConfig;
 pub use httpupgrade::HttpUpgradeConfig;
 pub use listener::{SocketOpts, bind_tcp};
 pub use stream::Stream;
 pub use tls::TlsServer;
 pub use ws::{WsConfig, WsStream};
-pub use grpc::GrpcConfig;
 
 /// Transport-security layer for an inbound listener.
 #[derive(Clone)]

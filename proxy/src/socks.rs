@@ -18,6 +18,7 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use transport::Stream;
 
+use crate::ProxyInbound;
 use crate::io::relay_tcp;
 
 const VERSION5: u8 = 0x05;
@@ -296,5 +297,17 @@ async fn socks_udp_associate(
                 }
             }
         }
+    }
+}
+
+impl ProxyInbound for Socks {
+    async fn serve(
+        &self,
+        ctx: &Ctx,
+        conn: Stream,
+        disp: &Dispatcher,
+        policy: &Policy,
+    ) -> io::Result<()> {
+        Socks::process(self, ctx, conn, disp, policy).await
     }
 }

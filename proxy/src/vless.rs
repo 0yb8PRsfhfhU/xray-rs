@@ -16,6 +16,7 @@ use kernel::types::net::{self, AddrCodec};
 use kernel::{Ctx, Destination, Dispatcher, Policy, Timer, Uuid};
 use transport::Stream;
 
+use crate::ProxyInbound;
 use crate::io::{read_header, relay_tcp};
 use crate::udp::relay_vless_udp;
 
@@ -124,5 +125,17 @@ impl Vless {
             }
             VlessReq::Mux => crate::mux::serve(conn, leftover, ctx, disp, policy).await,
         }
+    }
+}
+
+impl ProxyInbound for Vless {
+    async fn serve(
+        &self,
+        ctx: &Ctx,
+        conn: Stream,
+        disp: &Dispatcher,
+        policy: &Policy,
+    ) -> io::Result<()> {
+        Vless::process(self, ctx, conn, disp, policy).await
     }
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use kernel::{Ctx, Dispatcher, Policy};
+use proxy::ProxyInbound;
 use transport::{SocketOpts, accept_stream, bind_tcp};
 
 use crate::config::{Built, InboundInstance};
@@ -95,7 +96,7 @@ async fn serve(ib: InboundInstance, disp: Arc<Dispatcher>, policy: Policy) -> Re
                 }
             };
             let ctx = Ctx::new(tag, Some(peer));
-            if let Err(e) = handler.process(&ctx, stream, &disp, &policy).await {
+            if let Err(e) = handler.serve(&ctx, stream, &disp, &policy).await {
                 tracing::debug!(session = ctx.id, error = %e, "connection ended");
             }
         });

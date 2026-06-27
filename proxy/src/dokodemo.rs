@@ -15,6 +15,7 @@ use bytes::Bytes;
 use kernel::{Address, Ctx, Destination, Dispatcher, Policy, Timer};
 use transport::Stream;
 
+use crate::ProxyInbound;
 use crate::io::relay_tcp;
 
 /// dokodemo-door inbound: relay every connection to a fixed destination.
@@ -38,5 +39,17 @@ impl Dokodemo {
         let dest = Destination::tcp(self.address.clone(), self.port);
         let timer = Timer::new(policy.idle);
         relay_tcp(conn, dest, Bytes::new(), ctx, disp, timer).await
+    }
+}
+
+impl ProxyInbound for Dokodemo {
+    async fn serve(
+        &self,
+        ctx: &Ctx,
+        conn: Stream,
+        disp: &Dispatcher,
+        policy: &Policy,
+    ) -> io::Result<()> {
+        Dokodemo::process(self, ctx, conn, disp, policy).await
     }
 }

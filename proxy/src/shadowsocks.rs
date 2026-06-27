@@ -19,6 +19,7 @@ use kernel::{Ctx, Destination, Dispatcher, Policy, Timer, UdpLink, UdpPacket};
 use transport::Stream;
 
 use crate::crypto::{Aead, AeadKind, NonceCtr, evp_bytes_to_key, hkdf_sha1};
+use crate::{ProxyInbound, UdpProxyInbound};
 
 const TAG: usize = AeadKind::TAG;
 const SUBKEY_INFO: &[u8] = b"ss-subkey";
@@ -345,5 +346,29 @@ impl Shadowsocks {
                 }
             }
         }
+    }
+}
+
+impl ProxyInbound for Shadowsocks {
+    async fn serve(
+        &self,
+        ctx: &Ctx,
+        conn: Stream,
+        disp: &Dispatcher,
+        policy: &Policy,
+    ) -> io::Result<()> {
+        Shadowsocks::process(self, ctx, conn, disp, policy).await
+    }
+}
+
+impl UdpProxyInbound for Shadowsocks {
+    async fn serve_udp(
+        &self,
+        socket: Arc<UdpSocket>,
+        ctx: &Ctx,
+        disp: &Dispatcher,
+        policy: &Policy,
+    ) -> io::Result<()> {
+        Shadowsocks::serve_udp(self, socket, ctx, disp, policy).await
     }
 }
