@@ -5,12 +5,20 @@
 use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use crate::{Raw, Transport};
 
 /// Server httpupgrade settings.
 #[derive(Debug, Clone, Default)]
 pub struct HttpUpgradeConfig {
     pub path: String,
     pub host: Option<String>,
+}
+
+impl Transport for HttpUpgradeConfig {
+    type Stream = Raw;
+    async fn accept(&self, stream: Raw) -> io::Result<Raw> {
+        accept(stream, self).await
+    }
 }
 
 const MAX_HEAD: usize = 16384;

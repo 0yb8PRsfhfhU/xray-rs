@@ -15,12 +15,20 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use crate::{Raw, Transport};
 
 /// Server websocket transport settings.
 #[derive(Debug, Clone, Default)]
 pub struct WsConfig {
     pub path: String,
     pub host: Option<String>,
+}
+
+impl Transport for WsConfig {
+    type Stream = WsStream<Raw>;
+    async fn accept(&self, stream: Raw) -> io::Result<WsStream<Raw>> {
+        accept(stream, self).await
+    }
 }
 
 /// Adapter exposing a WebSocket stream as a byte stream.

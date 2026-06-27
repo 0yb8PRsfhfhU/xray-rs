@@ -27,6 +27,7 @@ use http::{HeaderMap, HeaderValue, Method, Response};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::oneshot;
 
+use crate::Transport;
 use crate::stream::Raw;
 
 /// Reject any single gRPC message claiming more than this many bytes. Real
@@ -40,6 +41,13 @@ pub struct GrpcConfig {
     /// gRPC service name. The accepted path is `/<service_name>/Tun`. When
     /// empty, any service name is accepted (the path need only address `/Tun`).
     pub service_name: String,
+}
+
+impl Transport for GrpcConfig {
+    type Stream = GrpcStream<Raw>;
+    async fn accept(&self, stream: Raw) -> io::Result<GrpcStream<Raw>> {
+        accept(stream, self).await
+    }
 }
 
 /// Perform the server-side gRPC (HTTP/2) handshake over `raw`, accept the

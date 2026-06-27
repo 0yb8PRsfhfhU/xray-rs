@@ -46,6 +46,14 @@ pub enum TransportKind {
     Grpc(Arc<grpc::GrpcConfig>),
 }
 
+pub trait Transport {
+    type Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static;
+    fn accept(
+        &self,
+        stream: crate::stream::Raw,
+    ) -> impl Future<Output = std::io::Result<Self::Stream>> + Send;
+}
+
 /// Full inbound stream configuration: security + transport.
 #[derive(Clone)]
 pub struct StreamConfig {
@@ -62,6 +70,27 @@ impl StreamConfig {
     }
 }
 
+impl Transport for TransportKind {
+    type Stream = Stream;
+    async fn accept(&self, raw: crate::stream::Raw) -> std::io::Result<Stream> {
+        match self {
+            TransportKind::Raw => Ok(Stream::Raw(raw)),
+            TransportKind::Ws(cfg) => {
+                let ws = ws::accept(raw, cfg).await?;
+                Ok(Stream::Ws(Box::new(ws)))
+            }
+            TransportKind::HttpUpgrade(cfg) => {
+                let raw = httpupgrade::accept(raw, cfg).await?;
+                Ok(Stream::Raw(raw))
+            }
+            TransportKind::Grpc(cfg) => {
+                let grpc = grpc::accept(raw, cfg).await?;
+                Ok(Stream::Grpc(Box::new(grpc)))
+            }
+        }
+    }
+}
+
 /// Apply security then transport to an accepted TCP connection, producing the
 /// composed [`Stream`] handed to an inbound handler.
 pub async fn accept_stream(tcp: TcpStream, cfg: &StreamConfig) -> std::io::Result<Stream> {
@@ -69,19 +98,5 @@ pub async fn accept_stream(tcp: TcpStream, cfg: &StreamConfig) -> std::io::Resul
         Security::None => Raw::Tcp(tcp),
         Security::Tls(server) => Raw::Tls(Box::new(server.accept(tcp).await?)),
     };
-    match &cfg.transport {
-        TransportKind::Raw => Ok(Stream::Raw(raw)),
-        TransportKind::Ws(cfg) => {
-            let ws = ws::accept(raw, cfg).await?;
-            Ok(Stream::Ws(Box::new(ws)))
-        }
-        TransportKind::HttpUpgrade(cfg) => {
-            let raw = httpupgrade::accept(raw, cfg).await?;
-            Ok(Stream::Raw(raw))
-        }
-        TransportKind::Grpc(cfg) => {
-            let grpc = grpc::accept(raw, cfg).await?;
-            Ok(Stream::Grpc(Box::new(grpc)))
-        }
-    }
+    cfg.transport.accept(raw).await
 }
