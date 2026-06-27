@@ -40,15 +40,66 @@ pub struct InboundCfg {
     #[serde(default = "default_listen")]
     pub listen: String,
     pub port: u16,
-    pub protocol: String,
-    pub method: Option<String>,
-    #[serde(default)]
-    pub users: Vec<UserCfg>,
+    #[serde(flatten)]
+    pub protocol: InboundProtocolCfg,
     pub tls: Option<TlsCfg>,
     pub transport: Option<TransportCfg>,
-    /// dokodemo-door fixed relay target (host/domain). `port` is the LISTEN port.
-    pub target_address: Option<String>,
-    pub target_port: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "protocol")]
+pub enum InboundProtocolCfg {
+    #[serde(rename = "vless")]
+    Vless {
+        #[serde(default)]
+        users: Vec<IdUserCfg>,
+    },
+    #[serde(rename = "vmess")]
+    Vmess {
+        #[serde(default)]
+        users: Vec<IdUserCfg>,
+    },
+    #[serde(rename = "trojan")]
+    Trojan {
+        #[serde(default)]
+        users: Vec<PasswordUserCfg>,
+    },
+    #[serde(rename = "shadowsocks", alias = "ss")]
+    Shadowsocks {
+        method: String,
+        #[serde(default)]
+        users: Vec<PasswordUserCfg>,
+    },
+    #[serde(rename = "socks", alias = "socks5")]
+    Socks {
+        #[serde(default)]
+        users: Vec<AccountUserCfg>,
+    },
+    #[serde(rename = "http")]
+    Http {
+        #[serde(default)]
+        users: Vec<AccountUserCfg>,
+    },
+    #[serde(rename = "dokodemo", alias = "dokodemo-door")]
+    Dokodemo {
+        /// dokodemo-door fixed relay target (host/domain). `port` is the LISTEN port.
+        target_address: String,
+        target_port: u16,
+    },
+}
+
+impl InboundProtocolCfg {
+    fn default_tag(&self) -> &'static str {
+        match self {
+            Self::Vless { .. } => "vless",
+            Self::Vmess { .. } => "vmess",
+            Self::Trojan { .. } => "trojan",
+            Self::Shadowsocks { .. } => "shadowsocks",
+            Self::Socks { .. } => "socks",
+            Self::Http { .. } => "http",
+            Self::Dokodemo { .. } => "dokodemo",
+        }
+    }
 }
 
 fn default_listen() -> String {
@@ -56,14 +107,27 @@ fn default_listen() -> String {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct UserCfg {
-    pub uuid: Option<String>,
-    pub username: Option<String>,
-    pub password: Option<String>,
+pub struct IdUserCfg {
+    pub uuid: String,
     #[serde(default)]
     pub email: String,
     #[serde(default)]
     pub level: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasswordUserCfg {
+    pub password: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub level: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AccountUserCfg {
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,19 +138,52 @@ pub struct TlsCfg {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TransportCfg {
-    #[serde(rename = "type")]
-    pub kind: String,
-    #[serde(default)]
-    pub path: String,
-    pub host: Option<String>,
-    pub service_name: Option<String>,
+#[serde(tag = "type")]
+pub enum TransportCfg {
+    #[serde(rename = "tcp", alias = "raw")]
+    Raw,
+    #[serde(rename = "ws", alias = "websocket")]
+    Ws {
+        #[serde(default)]
+        path: String,
+        host: Option<String>,
+    },
+    #[serde(rename = "httpupgrade")]
+    HttpUpgrade {
+        #[serde(default)]
+        path: String,
+        host: Option<String>,
+    },
+    #[serde(rename = "grpc", alias = "gun")]
+    Grpc {
+        #[serde(default)]
+        service_name: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
 pub struct OutboundCfg {
     pub tag: Option<String>,
-    pub protocol: String,
+    #[serde(flatten)]
+    pub protocol: OutboundProtocolCfg,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "protocol")]
+pub enum OutboundProtocolCfg {
+    #[serde(rename = "freedom", alias = "direct")]
+    Freedom,
+    #[serde(rename = "blackhole", alias = "block")]
+    Blackhole,
+}
+
+impl OutboundProtocolCfg {
+    fn default_tag(&self) -> &'static str {
+        match self {
+            Self::Freedom => "freedom",
+            Self::Blackhole => "blackhole",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,11 +234,10 @@ impl Config {
         let mut outbounds: HashMap<CompactString, Outbound> = HashMap::new();
         let mut default_tag: Option<CompactString> = None;
         for ob in &self.outbounds {
-            let tag = CompactString::new(ob.tag.as_deref().unwrap_or(&ob.protocol));
-            let outbound = match ob.protocol.as_str() {
-                "freedom" | "direct" => Outbound::Freedom,
-                "blackhole" | "block" => Outbound::Blackhole,
-                other => bail!("unknown outbound protocol: {other}"),
+            let tag = CompactString::new(ob.tag.as_deref().unwrap_or(ob.protocol.default_tag()));
+            let outbound = match ob.protocol {
+                OutboundProtocolCfg::Freedom => Outbound::Freedom,
+                OutboundProtocolCfg::Blackhole => Outbound::Blackhole,
             };
             if default_tag.is_none() {
                 default_tag = Some(tag.clone());
@@ -242,125 +338,101 @@ fn parse_port_range(s: &str) -> Result<(u16, u16)> {
 }
 
 fn build_inbound(ib: InboundCfg) -> Result<InboundInstance> {
-    let tag = CompactString::new(ib.tag.clone().unwrap_or_else(|| ib.protocol.clone()));
+    let InboundCfg {
+        tag,
+        listen,
+        port,
+        protocol,
+        tls,
+        transport,
+    } = ib;
 
-    let handler = match ib.protocol.as_str() {
-        "vless" => {
-            let mut users = Vec::new();
-            for u in &ib.users {
-                let uuid = u
-                    .uuid
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("vless user missing uuid"))?;
-                let id = kernel::Uuid::parse_str(uuid).map_err(|e| anyhow!("bad uuid: {e}"))?;
-                users.push((id, CompactString::new(&u.email), u.level));
+    let tag = CompactString::new(tag.unwrap_or_else(|| protocol.default_tag().to_string()));
+
+    let handler = match protocol {
+        InboundProtocolCfg::Vless { users } => {
+            let mut built_users = Vec::new();
+            for user in users {
+                let id =
+                    kernel::Uuid::parse_str(&user.uuid).map_err(|e| anyhow!("bad uuid: {e}"))?;
+                built_users.push((id, CompactString::new(&user.email), user.level));
             }
-            Inbound::Vless(Vless::new(Arc::new(VlessUsers::new(users))))
+            Inbound::Vless(Vless::new(Arc::new(VlessUsers::new(built_users))))
         }
-        "vmess" => {
-            let mut users = Vec::new();
-            for u in &ib.users {
-                let uuid = u
-                    .uuid
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("vmess user missing uuid"))?;
-                let id = kernel::Uuid::parse_str(uuid).map_err(|e| anyhow!("bad uuid: {e}"))?;
-                users.push((id, CompactString::new(&u.email), u.level));
+        InboundProtocolCfg::Vmess { users } => {
+            let mut built_users = Vec::new();
+            for user in users {
+                let id =
+                    kernel::Uuid::parse_str(&user.uuid).map_err(|e| anyhow!("bad uuid: {e}"))?;
+                built_users.push((id, CompactString::new(&user.email), user.level));
             }
-            let table = VmessUsers::new(users).map_err(|e| anyhow!("vmess users: {e}"))?;
+            let table = VmessUsers::new(built_users).map_err(|e| anyhow!("vmess users: {e}"))?;
             Inbound::Vmess(Vmess::new(Arc::new(table)))
         }
-        "trojan" => {
-            let mut users = Vec::new();
-            for u in &ib.users {
-                let pw = u
-                    .password
-                    .clone()
-                    .ok_or_else(|| anyhow!("trojan user missing password"))?;
-                users.push((pw, CompactString::new(&u.email), u.level));
+        InboundProtocolCfg::Trojan { users } => {
+            let mut built_users = Vec::new();
+            for user in users {
+                built_users.push((user.password, CompactString::new(&user.email), user.level));
             }
-            Inbound::Trojan(Trojan::new(Arc::new(TrojanUsers::new(users))))
+            Inbound::Trojan(Trojan::new(Arc::new(TrojanUsers::new(built_users))))
         }
-        "shadowsocks" | "ss" => {
-            let method = ib
-                .method
-                .as_deref()
-                .ok_or_else(|| anyhow!("shadowsocks inbound missing method"))?;
-            let kind = proxy::shadowsocks::method_kind(method)
+        InboundProtocolCfg::Shadowsocks { method, users } => {
+            let kind = proxy::shadowsocks::method_kind(&method)
                 .ok_or_else(|| anyhow!("unsupported shadowsocks method: {method}"))?;
-            let mut users = Vec::new();
-            for u in &ib.users {
-                let pw = u
-                    .password
-                    .clone()
-                    .ok_or_else(|| anyhow!("shadowsocks user missing password"))?;
-                users.push((pw, CompactString::new(&u.email), u.level));
+            let mut built_users = Vec::new();
+            for user in users {
+                built_users.push((user.password, CompactString::new(&user.email), user.level));
             }
-            Inbound::Shadowsocks(Shadowsocks::new(kind, users))
+            Inbound::Shadowsocks(Shadowsocks::new(kind, built_users))
         }
-        "socks" | "socks5" => {
+        InboundProtocolCfg::Socks { users } => {
             let mut accounts = Vec::new();
-            for u in &ib.users {
-                let username = u
-                    .username
-                    .clone()
-                    .ok_or_else(|| anyhow!("socks user missing username"))?;
-                let password = u
-                    .password
-                    .clone()
-                    .ok_or_else(|| anyhow!("socks user missing password"))?;
-                accounts.push(SocksAccount { username, password });
+            for user in users {
+                accounts.push(SocksAccount {
+                    username: user.username,
+                    password: user.password,
+                });
             }
             Inbound::Socks(Socks::new(accounts))
         }
-        "http" => {
+        InboundProtocolCfg::Http { users } => {
             let mut accounts = Vec::new();
-            for u in &ib.users {
-                let username = u
-                    .username
-                    .clone()
-                    .ok_or_else(|| anyhow!("http user missing username"))?;
-                let password = u
-                    .password
-                    .clone()
-                    .ok_or_else(|| anyhow!("http user missing password"))?;
-                accounts.push(HttpAccount { username, password });
+            for user in users {
+                accounts.push(HttpAccount {
+                    username: user.username,
+                    password: user.password,
+                });
             }
             Inbound::Http(Http::new(accounts))
         }
-        "dokodemo" | "dokodemo-door" => {
-            let addr = ib
-                .target_address
-                .as_deref()
-                .ok_or_else(|| anyhow!("dokodemo inbound missing target_address"))?;
-            let port = ib
-                .target_port
-                .ok_or_else(|| anyhow!("dokodemo inbound missing target_port"))?;
-            Inbound::Dokodemo(Dokodemo::new(kernel::Address::parse(addr), port))
-        }
-        other => bail!("unknown/unsupported inbound protocol: {other}"),
+        InboundProtocolCfg::Dokodemo {
+            target_address,
+            target_port,
+        } => Inbound::Dokodemo(Dokodemo::new(
+            kernel::Address::parse(&target_address),
+            target_port,
+        )),
     };
 
-    let stream = build_stream(&ib)?;
+    let stream = build_stream(tls, transport)?;
 
     Ok(InboundInstance {
         tag,
-        listen: ib.listen,
-        port: ib.port,
+        listen,
+        port,
         stream,
         handler: Arc::new(handler),
     })
 }
 
-fn build_stream(ib: &InboundCfg) -> Result<StreamConfig> {
-    let security = match &ib.tls {
+fn build_stream(tls: Option<TlsCfg>, transport: Option<TransportCfg>) -> Result<StreamConfig> {
+    let security = match tls {
         None => Security::None,
         Some(tls) => {
             let cert = std::fs::read(&tls.cert).with_context(|| format!("reading {}", tls.cert))?;
             let key = std::fs::read(&tls.key).with_context(|| format!("reading {}", tls.key))?;
             let alpn = tls
                 .alpn
-                .clone()
                 .unwrap_or_else(|| vec!["h2".to_string(), "http/1.1".to_string()]);
             let server =
                 TlsServer::from_pem(&cert, &key, &alpn).map_err(|e| anyhow!("tls setup: {e}"))?;
@@ -368,27 +440,94 @@ fn build_stream(ib: &InboundCfg) -> Result<StreamConfig> {
         }
     };
 
-    let transport = match &ib.transport {
+    let transport = match transport {
         None => TransportKind::Raw,
-        Some(t) => match t.kind.as_str() {
-            "tcp" | "raw" => TransportKind::Raw,
-            "ws" | "websocket" => TransportKind::Ws(Arc::new(WsConfig {
-                path: t.path.clone(),
-                host: t.host.clone(),
-            })),
-            "httpupgrade" => TransportKind::HttpUpgrade(Arc::new(HttpUpgradeConfig {
-                path: t.path.clone(),
-                host: t.host.clone(),
-            })),
-            "grpc" | "gun" => TransportKind::Grpc(Arc::new(GrpcConfig {
-                service_name: t.service_name.clone().unwrap_or_default(),
-            })),
-            other => bail!("unknown transport: {other}"),
-        },
+        Some(TransportCfg::Raw) => TransportKind::Raw,
+        Some(TransportCfg::Ws { path, host }) => {
+            TransportKind::Ws(Arc::new(WsConfig { path, host }))
+        }
+        Some(TransportCfg::HttpUpgrade { path, host }) => {
+            TransportKind::HttpUpgrade(Arc::new(HttpUpgradeConfig { path, host }))
+        }
+        Some(TransportCfg::Grpc { service_name }) => {
+            TransportKind::Grpc(Arc::new(GrpcConfig { service_name }))
+        }
     };
 
     Ok(StreamConfig {
         security,
         transport,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_inbound_and_transport_aliases() {
+        let text = r#"
+            [[inbound]]
+            port = 1080
+            protocol = "socks5"
+              [[inbound.users]]
+              username = "alice"
+              password = "secret"
+              [inbound.transport]
+              type = "websocket"
+              path = "/ws"
+
+            [[inbound]]
+            port = 8388
+            protocol = "ss"
+            method = "aes-128-gcm"
+              [[inbound.users]]
+              password = "ss-secret"
+
+            [[inbound]]
+            port = 5300
+            protocol = "dokodemo-door"
+            target_address = "1.1.1.1"
+            target_port = 53
+
+            [[outbound]]
+            protocol = "direct"
+        "#;
+
+        let cfg = Config::parse(text).expect("config parse should succeed");
+
+        assert!(matches!(
+            cfg.inbounds[0].protocol,
+            InboundProtocolCfg::Socks { .. }
+        ));
+        assert!(matches!(
+            cfg.inbounds[0].transport,
+            Some(TransportCfg::Ws { .. })
+        ));
+        assert!(matches!(
+            cfg.inbounds[1].protocol,
+            InboundProtocolCfg::Shadowsocks { .. }
+        ));
+        assert!(matches!(
+            cfg.inbounds[2].protocol,
+            InboundProtocolCfg::Dokodemo { .. }
+        ));
+        assert!(matches!(
+            cfg.outbounds[0].protocol,
+            OutboundProtocolCfg::Freedom
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_protocol() {
+        let text = r#"
+            [[inbound]]
+            port = 1080
+            protocol = "unknown-proto"
+        "#;
+
+        let err = Config::parse(text).expect_err("unknown protocol must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown variant"));
+    }
 }
