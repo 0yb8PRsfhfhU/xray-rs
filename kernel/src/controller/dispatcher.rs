@@ -4,13 +4,13 @@ use std::collections::HashMap;
 
 use compact_str::CompactString;
 
-use crate::egress::dialer::SystemDialer;
-use crate::types::net::Destination;
-use crate::egress::outbound::Outbound;
-use crate::pipe_asm::pipe::{LINK_CAPACITY, Link, UdpLink, pipe, udp_pipe};
 use crate::controller::router::{RouteCtx, Router};
 use crate::controller::session::Ctx;
+use crate::egress::dialer::SystemDialer;
+use crate::egress::outbound::Outbound;
+use crate::pipe_asm::pipe::{LINK_CAPACITY, Link, UdpLink, pipe, udp_pipe};
 use crate::pipe_asm::timer::Timer;
+use crate::types::net::Destination;
 
 /// Owns the outbound set + router and wires inbound flows to outbounds.
 pub struct Dispatcher {
@@ -38,7 +38,7 @@ impl Dispatcher {
     /// Convenience: a dispatcher with a single `freedom` outbound and no router.
     pub fn single_freedom(dialer: SystemDialer) -> Dispatcher {
         let mut outbounds = HashMap::new();
-        outbounds.insert(CompactString::new("freedom"), Outbound::freedom());
+        outbounds.insert(CompactString::new("freedom"), Outbound::Freedom);
         Dispatcher::new(dialer, outbounds, "freedom", None)
     }
 
@@ -65,7 +65,7 @@ impl Dispatcher {
         self.outbounds
             .get(self.default_tag.as_str())
             .cloned()
-            .unwrap_or_else(Outbound::freedom)
+            .unwrap_or(Outbound::Freedom)
     }
 
     /// Dispatch a TCP flow to `dest`; returns the inbound half of the pipe.
@@ -100,7 +100,7 @@ impl Dispatcher {
             .outbounds
             .get(self.default_tag.as_str())
             .cloned()
-            .unwrap_or_else(Outbound::freedom);
+            .unwrap_or(Outbound::Freedom);
         let dialer = self.dialer.clone();
         let id = ctx.id;
         tokio::spawn(async move {

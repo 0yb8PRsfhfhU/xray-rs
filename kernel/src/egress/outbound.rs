@@ -21,14 +21,6 @@ pub enum Outbound {
 }
 
 impl Outbound {
-    pub fn freedom() -> Outbound {
-        Outbound::Freedom
-    }
-
-    pub fn blackhole() -> Outbound {
-        Outbound::Blackhole
-    }
-
     /// Handle a TCP flow to `dest`, pumping bytes between the link and target.
     pub async fn handle_tcp(
         &self,

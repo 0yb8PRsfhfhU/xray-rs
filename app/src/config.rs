@@ -139,8 +139,8 @@ impl Config {
         for ob in &self.outbounds {
             let tag = CompactString::new(ob.tag.as_deref().unwrap_or(&ob.protocol));
             let outbound = match ob.protocol.as_str() {
-                "freedom" | "direct" => Outbound::freedom(),
-                "blackhole" | "block" => Outbound::blackhole(),
+                "freedom" | "direct" => Outbound::Freedom,
+                "blackhole" | "block" => Outbound::Blackhole,
                 other => bail!("unknown outbound protocol: {other}"),
             };
             if default_tag.is_none() {
@@ -149,7 +149,7 @@ impl Config {
             outbounds.insert(tag, outbound);
         }
         if outbounds.is_empty() {
-            outbounds.insert(CompactString::new("freedom"), Outbound::freedom());
+            outbounds.insert(CompactString::new("freedom"), Outbound::Freedom);
             default_tag = Some(CompactString::new("freedom"));
         }
         let default_tag = default_tag.unwrap_or_else(|| CompactString::new("freedom"));
