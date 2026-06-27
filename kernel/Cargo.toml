@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 tokio.workspace = true
+smallvec.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
 bytes.workspace = true

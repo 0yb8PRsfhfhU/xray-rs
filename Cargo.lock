@@ -828,6 +828,7 @@ dependencies = [
  "moka",
  "rand",
  "sha1",
+ "smallvec",
  "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",

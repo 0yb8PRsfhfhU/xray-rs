@@ -27,41 +27,31 @@ impl SystemDialer {
 
     /// Connect a TCP stream to `dest`, trying each resolved IP in turn.
     pub async fn dial_tcp(&self, dest: &Destination) -> io::Result<TcpStream> {
-        match &dest.address {
-            Address::Ip(ip) => {
-                let stream = TcpStream::connect(SocketAddr::new(*ip, dest.port)).await?;
-                let _ = stream.set_nodelay(true);
-                Ok(stream)
-            }
-            Address::Domain(d) => {
-                let ips = self.resolver.resolve(d).await?;
-                let mut last = io::Error::new(io::ErrorKind::NotFound, "no addresses for domain");
-                for ip in ips.iter() {
-                    match TcpStream::connect(SocketAddr::new(*ip, dest.port)).await {
-                        Ok(s) => {
-                            let _ = s.set_nodelay(true);
-                            return Ok(s);
-                        }
-                        Err(e) => last = e,
-                    }
-                }
-                Err(last)
-            }
+        let resolve = self.resolve_addr(dest).await?;
+        for dest in resolve {
+            let Ok(stream) = TcpStream::connect(dest).await else {
+                continue;
+            };
+            let _ = stream.set_nodelay(true);
+            return Ok(stream);
         }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no addresses for domain",
+        ))
     }
 
     /// Resolve `dest` to a single socket address (first IP).
-    pub async fn resolve_addr(&self, dest: &Destination) -> io::Result<SocketAddr> {
+    pub async fn resolve_addr(&self, dest: &Destination) -> io::Result<Vec<SocketAddr>> {
         match &dest.address {
-            Address::Ip(ip) => Ok(SocketAddr::new(*ip, dest.port)),
+            Address::Ip(ip) => Ok(vec![SocketAddr::new(*ip, dest.port)]),
             Address::Domain(d) => {
                 let ips = self.resolver.resolve(d).await?;
-                let ip = ips
-                    .iter()
-                    .next()
-                    .copied()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "empty resolve"))?;
-                Ok(SocketAddr::new(ip, dest.port))
+                let socket_addrs = ips
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(*ip, dest.port))
+                    .collect();
+                Ok(socket_addrs)
             }
         }
     }

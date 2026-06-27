@@ -2,7 +2,6 @@
 //! closed `enum` per SPEC §P1 — no trait objects.
 
 use std::io;
-
 use bytes::Bytes;
 
 use crate::pipe_asm::copy::splice;
@@ -69,7 +68,8 @@ async fn freedom_udp(dialer: &SystemDialer, link: UdpLink, timer: &Timer) -> io:
         while let Some(pkt) = reader.recv().await {
             timer.update();
             let addr = dialer.resolve_addr(&pkt.target).await?;
-            send_sock.send_to(&pkt.data, addr).await?;
+            let first_addr = addr.first().ok_or(io::Error::new(io::ErrorKind::NotFound, "no addresses for domain"))?;
+            send_sock.send_to(&pkt.data, first_addr).await?;
         }
         Ok(())
     };
