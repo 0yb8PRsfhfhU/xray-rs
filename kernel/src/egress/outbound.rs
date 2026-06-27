@@ -1,14 +1,14 @@
 //! Outbound handlers: `freedom` (direct) and `blackhole` (drop). Summed into a
 //! closed `enum` per SPEC §P1 — no trait objects.
 
-use std::io;
 use bytes::Bytes;
+use std::io;
 
-use crate::pipe_asm::copy::splice;
 use crate::egress::dialer::SystemDialer;
-use crate::types::net::{Address, Destination};
+use crate::pipe_asm::copy::splice;
 use crate::pipe_asm::pipe::{Link, UdpLink, UdpPacket};
 use crate::pipe_asm::timer::Timer;
+use crate::types::net::{Address, Destination};
 
 /// Closed sum of server outbounds.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -68,7 +68,10 @@ async fn freedom_udp(dialer: &SystemDialer, link: UdpLink, timer: &Timer) -> io:
         while let Some(pkt) = reader.recv().await {
             timer.update();
             let addr = dialer.resolve_addr(&pkt.target).await?;
-            let first_addr = addr.first().ok_or(io::Error::new(io::ErrorKind::NotFound, "no addresses for domain"))?;
+            let first_addr = addr.first().ok_or(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no addresses for domain",
+            ))?;
             send_sock.send_to(&pkt.data, first_addr).await?;
         }
         Ok(())
