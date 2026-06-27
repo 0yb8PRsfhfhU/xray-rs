@@ -10,15 +10,15 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes::Aes128;
-use aes::cipher::{BlockDecrypt, generic_array::GenericArray};
+use aes::cipher::BlockCipherDecrypt;
 use aes_gcm::aead::{Aead as _, Payload};
 use aes_gcm::{Aes128Gcm, KeyInit as _GcmInit, Nonce};
 use bytes::{Bytes, BytesMut};
 use compact_str::CompactString;
-use hmac::digest::{ExtendableOutput, Update as _, XofReader};
 use md5::Md5;
 use sha2::{Digest, Sha256};
-use sha3::Shake128;
+use shake::digest::{ExtendableOutput, Update as _, XofReader};
+use shake::{Shake128, Shake128Reader};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
@@ -223,8 +223,8 @@ impl VmessUsers {
         for (id, email, level) in users {
             let ck = cmd_key(&id);
             let authid_key = kdf16(&ck, &[SALT_AUTHID]);
-            let cipher =
-                Aes128::new_from_slice(&authid_key).map_err(|_| Error::Crypto("aes key"))?;
+            let cipher = <Aes128 as aes::cipher::KeyInit>::new_from_slice(&authid_key)
+                .map_err(|_| Error::Crypto("aes key"))?;
             out.push(VmessUser {
                 cmd_key: ck,
                 authid_cipher: cipher,
@@ -242,9 +242,9 @@ impl VmessUsers {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         for user in &self.users {
-            let mut block = GenericArray::clone_from_slice(authid);
+            let mut block = aes::cipher::Block::<Aes128>::from(*authid);
             user.authid_cipher.decrypt_block(&mut block);
-            let plain = block.as_slice();
+            let plain: &[u8] = block.as_ref();
             let (ts_bytes, rest) = match plain.split_at_checked(8) {
                 Some(v) => v,
                 None => continue,
@@ -279,7 +279,7 @@ impl VmessUsers {
 // ---------------------------------------------------------------------------
 
 struct ShakeParser {
-    reader: sha3::Shake128Reader,
+    reader: Shake128Reader,
 }
 
 impl ShakeParser {
