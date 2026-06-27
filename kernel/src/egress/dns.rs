@@ -5,33 +5,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use compact_str::CompactString;
-use hickory_resolver::TokioAsyncResolver;
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::TokioResolver;
 use moka::future::Cache;
 
 /// Resolver backed by `hickory-resolver` with a bounded, TTL'd `moka` cache in
 /// front to dedupe and bound the slow path.
-pub struct Resolver {
-    inner: TokioAsyncResolver,
+pub struct CachedResolver {
+    inner: TokioResolver,
     cache: Cache<CompactString, Arc<[IpAddr]>>,
 }
 
-impl Resolver {
+impl CachedResolver {
     /// Build a resolver from the system configuration, falling back to public
     /// resolvers when `/etc/resolv.conf` is unavailable.
-    pub fn system() -> Resolver {
-        let inner = TokioAsyncResolver::tokio_from_system_conf().unwrap_or_else(|_| {
-            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
-        });
-        Resolver::with_resolver(inner)
+    pub fn system() -> Result<Self, hickory_resolver::net::NetError> {
+        let inner = TokioResolver::builder_tokio()?.build()?;
+        Ok(CachedResolver::with_resolver(inner))
     }
 
-    fn with_resolver(inner: TokioAsyncResolver) -> Resolver {
+    fn with_resolver(inner: TokioResolver) -> CachedResolver {
         let cache = Cache::builder()
             .max_capacity(8192)
             .time_to_live(Duration::from_secs(30))
             .build();
-        Resolver { inner, cache }
+        CachedResolver { inner, cache }
     }
 
     /// Resolve a hostname to one or more IPs. IP literals short-circuit.

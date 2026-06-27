@@ -9,7 +9,7 @@ use compact_str::CompactString;
 use serde::Deserialize;
 
 use kernel::controller::router::{Cidr, DomainMatcher, Router, Rule};
-use kernel::{Dispatcher, Network, Outbound, Resolver, SystemDialer};
+use kernel::{CachedResolver, Dispatcher, Network, Outbound, SystemDialer};
 use proxy::{
     Dokodemo, Http, HttpAccount, Inbound, Shadowsocks, Socks, SocksAccount, Trojan, TrojanUsers,
     Vless, VlessUsers, Vmess, VmessUsers,
@@ -131,7 +131,7 @@ impl Config {
 
     /// Build runtime objects (dispatcher, inbounds) from the parsed config.
     pub fn build(self) -> Result<Built> {
-        let resolver = Arc::new(Resolver::system());
+        let resolver = Arc::new(CachedResolver::system()?);
         let dialer = SystemDialer::new(resolver);
 
         let mut outbounds: HashMap<CompactString, Outbound> = HashMap::new();

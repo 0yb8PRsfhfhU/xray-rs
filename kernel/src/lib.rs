@@ -25,7 +25,7 @@ pub use controller::router::{Cidr, DomainMatcher, RouteCtx, Router, Rule};
 pub use controller::session::Ctx;
 pub use controller::sniff::{SniffedProtocol, sniff, sniff_http, sniff_tls};
 pub use egress::dialer::SystemDialer;
-pub use egress::dns::Resolver;
+pub use egress::dns::CachedResolver;
 pub use egress::outbound::Outbound;
 pub use pipe_asm::pipe::{Link, UdpLink, UdpPacket};
 pub use pipe_asm::timer::Timer;

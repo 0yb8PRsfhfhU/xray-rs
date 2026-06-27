@@ -6,22 +6,22 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpStream, UdpSocket};
 
-use crate::egress::dns::Resolver;
+use crate::egress::dns::CachedResolver;
 use crate::types::net::{Address, Destination};
 
 /// Dials real destinations directly, resolving domains through the shared
-/// cached [`Resolver`] (SPEC §P4).
+/// cached [`CachedResolver`] (SPEC §P4).
 #[derive(Clone)]
 pub struct SystemDialer {
-    resolver: Arc<Resolver>,
+    resolver: Arc<CachedResolver>,
 }
 
 impl SystemDialer {
-    pub fn new(resolver: Arc<Resolver>) -> SystemDialer {
+    pub fn new(resolver: Arc<CachedResolver>) -> SystemDialer {
         SystemDialer { resolver }
     }
 
-    pub fn resolver(&self) -> &Arc<Resolver> {
+    pub fn resolver(&self) -> &Arc<CachedResolver> {
         &self.resolver
     }
 
