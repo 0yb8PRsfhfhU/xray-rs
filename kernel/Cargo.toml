@@ -12,6 +12,7 @@ futures.workspace = true
 bytes.workspace = true
 compact_str.workspace = true
 arc-swap.workspace = true
+parking_lot.workspace = true
 moka.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

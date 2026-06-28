@@ -18,6 +18,10 @@ pub struct Ctx {
     pub source: Option<SocketAddr>,
     /// Local address the connection landed on.
     pub local: Option<SocketAddr>,
+    /// Authenticated user tag (`{inbound_tag}|{email}|{uid}`), set by the
+    /// handler after auth so the relay can attribute traffic. `None` outside
+    /// the panel integration.
+    pub user_email: Option<CompactString>,
 }
 
 impl Ctx {
@@ -27,6 +31,12 @@ impl Ctx {
             inbound_tag: inbound_tag.into(),
             source,
             local: None,
+            user_email: None,
         }
+    }
+
+    /// The authenticated user tag, if set.
+    pub fn user_email(&self) -> Option<&str> {
+        self.user_email.as_deref()
     }
 }

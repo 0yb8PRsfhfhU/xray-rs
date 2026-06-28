@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use compact_str::CompactString;
 use tokio::io::AsyncWriteExt;
@@ -62,15 +63,14 @@ enum VlessReq {
     Mux,
 }
 
-fn parse(buf: &mut Bytes, users: &VlessUsers) -> Result<VlessReq, Error> {
+fn parse(buf: &mut Bytes, users: &VlessUsers) -> Result<(VlessReq, CompactString), Error> {
     let ver = net::take_u8(buf)?;
     if ver != 0 {
         return Err(Error::Protocol("vless version"));
     }
     let id = net::take(buf, 16)?;
-    if users.get(&id).is_none() {
-        return Err(Error::Auth);
-    }
+    let user = users.get(&id).ok_or(Error::Auth)?;
+    let email = user.email.clone();
     let addon_len = net::take_u8(buf)? as usize;
     if addon_len > 0 {
         let _ = net::take(buf, addon_len)?;
@@ -79,25 +79,32 @@ fn parse(buf: &mut Bytes, users: &VlessUsers) -> Result<VlessReq, Error> {
     match cmd {
         CMD_TCP => {
             let (address, port) = AddrCodec::VLESS.read(buf)?;
-            Ok(VlessReq::Tcp(Destination::tcp(address, port)))
+            Ok((VlessReq::Tcp(Destination::tcp(address, port)), email))
         }
         CMD_UDP => {
             let (address, port) = AddrCodec::VLESS.read(buf)?;
-            Ok(VlessReq::Udp(Destination::udp(address, port)))
+            Ok((VlessReq::Udp(Destination::udp(address, port)), email))
         }
-        CMD_MUX => Ok(VlessReq::Mux),
+        CMD_MUX => Ok((VlessReq::Mux, email)),
         _ => Err(Error::Protocol("vless command")),
     }
 }
 
 /// VLESS inbound handler.
 pub struct Vless {
-    users: Arc<VlessUsers>,
+    users: ArcSwap<VlessUsers>,
 }
 
 impl Vless {
     pub fn new(users: Arc<VlessUsers>) -> Vless {
-        Vless { users }
+        Vless {
+            users: ArcSwap::from(users),
+        }
+    }
+
+    /// Swap in a new user table (live user sync, SPEC §P2).
+    pub fn set_users(&self, users: Arc<VlessUsers>) {
+        self.users.store(users);
     }
 
     pub async fn process(
@@ -107,13 +114,16 @@ impl Vless {
         disp: &Dispatcher,
         policy: &Policy,
     ) -> io::Result<()> {
-        let users = self.users.clone();
-        let (req, leftover) = read_header(&mut conn, policy.handshake, 16384, move |b| {
+        let users = self.users.load_full();
+        let ((req, email), leftover) = read_header(&mut conn, policy.handshake, 16384, move |b| {
             parse(b, &users)
         })
         .await?;
         // Response header: version 0, zero-length addons.
         conn.write_all(&[0u8, 0u8]).await?;
+        let mut ctx = ctx.clone();
+        ctx.user_email = Some(email);
+        let ctx = &ctx;
         match req {
             VlessReq::Tcp(dest) => {
                 let timer = Timer::new(policy.idle);

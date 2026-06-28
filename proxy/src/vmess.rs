@@ -469,16 +469,24 @@ struct Request {
     option: u8,
     security: u8,
     mux: bool,
+    email: CompactString,
 }
 
 /// VMess inbound handler.
 pub struct Vmess {
-    users: Arc<VmessUsers>,
+    users: arc_swap::ArcSwap<VmessUsers>,
 }
 
 impl Vmess {
     pub fn new(users: Arc<VmessUsers>) -> Vmess {
-        Vmess { users }
+        Vmess {
+            users: arc_swap::ArcSwap::from(users),
+        }
+    }
+
+    /// Swap in a new user table (live user sync, SPEC §P2).
+    pub fn set_users(&self, users: Arc<VmessUsers>) {
+        self.users.store(users);
     }
 
     pub async fn process(
@@ -491,6 +499,9 @@ impl Vmess {
         let req = timeout(policy.handshake, self.read_header(&mut conn))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
+        let mut ctx = ctx.clone();
+        ctx.user_email = Some(req.email.clone());
+        let ctx = &ctx;
 
         // Response key/iv derived from request key/iv.
         let resp_key_full = Sha256::digest(req.req_key);
@@ -584,17 +595,24 @@ impl Vmess {
         }
 
         let timer = Timer::new(policy.idle);
+        let counter = ctx
+            .user_email()
+            .and_then(|e| disp.stats().map(|s| s.counter(e)));
         let link = disp.dispatch_tcp(ctx, req.dest, timer.clone());
         let kernel::Link { mut reader, writer } = link;
         let (mut r, mut w) = tokio::io::split(conn);
         let token = timer.token();
 
+        let up_counter = counter.clone();
         let up_loop = async move {
             loop {
                 match read_chunk(&mut r, &mut up).await? {
                     Some(chunk) if chunk.is_empty() => continue,
                     Some(chunk) => {
                         timer.update();
+                        if let Some(c) = &up_counter {
+                            c.add_up(chunk.len() as u64);
+                        }
                         if writer.send(chunk).await.is_err() {
                             return io::Result::Ok(());
                         }
@@ -603,8 +621,12 @@ impl Vmess {
                 }
             }
         };
+        let down_counter = counter.clone();
         let down_loop = async move {
             while let Some(data) = reader.recv().await {
+                if let Some(c) = &down_counter {
+                    c.add_down(data.len() as u64);
+                }
                 write_chunk(&mut w, &mut down, &data).await?;
             }
             let _ = write_terminal(&mut w, &mut down).await;
@@ -625,12 +647,12 @@ impl Vmess {
     {
         let mut authid = [0u8; 16];
         conn.read_exact(&mut authid).await?;
-        let cmd_key = {
-            let user = self
-                .users
+        let (cmd_key, email) = {
+            let users = self.users.load();
+            let user = users
                 .match_user(&authid)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "vmess auth"))?;
-            user.cmd_key
+            (user.cmd_key, user.email.clone())
         };
 
         // [sealed length 18][connection nonce 8]
@@ -653,7 +675,10 @@ impl Vmess {
         let pay_iv = kdf(&cmd_key, &[SALT_HDR_IV, &authid, &nonce]);
         let header = aes128gcm_open(&pay_key, pay_iv.get(..12).unwrap_or(&[]), &payct, &authid)?;
 
-        parse_header(&header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let mut req =
+            parse_header(&header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        req.email = email;
+        Ok(req)
     }
 }
 
@@ -732,6 +757,7 @@ fn parse_header(header: &[u8]) -> Result<Request, Error> {
             option,
             security,
             mux: true,
+            email: CompactString::default(),
         });
     }
     let network = match cmd {
@@ -754,6 +780,7 @@ fn parse_header(header: &[u8]) -> Result<Request, Error> {
         option,
         security,
         mux: false,
+        email: CompactString::default(),
     })
 }
 

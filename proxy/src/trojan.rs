@@ -60,11 +60,10 @@ impl TrojanUsers {
 }
 
 /// Parse the trojan request header, authenticating the user.
-fn parse(buf: &mut Bytes, users: &TrojanUsers) -> Result<Destination, Error> {
+fn parse(buf: &mut Bytes, users: &TrojanUsers) -> Result<(Destination, CompactString), Error> {
     let hash = net::take(buf, 56)?;
-    if users.get(&hash).is_none() {
-        return Err(Error::Auth);
-    }
+    let user = users.get(&hash).ok_or(Error::Auth)?;
+    let email = user.email.clone();
     let _crlf = net::take(buf, 2)?;
     let cmd = net::take_u8(buf)?;
     let (address, port) = AddrCodec::TROJAN.read(buf)?;
@@ -74,21 +73,31 @@ fn parse(buf: &mut Bytes, users: &TrojanUsers) -> Result<Destination, Error> {
     } else {
         Network::Tcp
     };
-    Ok(Destination {
-        network,
-        address,
-        port,
-    })
+    Ok((
+        Destination {
+            network,
+            address,
+            port,
+        },
+        email,
+    ))
 }
 
 /// Trojan inbound handler.
 pub struct Trojan {
-    users: Arc<TrojanUsers>,
+    users: arc_swap::ArcSwap<TrojanUsers>,
 }
 
 impl Trojan {
     pub fn new(users: Arc<TrojanUsers>) -> Trojan {
-        Trojan { users }
+        Trojan {
+            users: arc_swap::ArcSwap::from(users),
+        }
+    }
+
+    /// Swap in a new user table (live user sync, SPEC §P2).
+    pub fn set_users(&self, users: Arc<TrojanUsers>) {
+        self.users.store(users);
     }
 }
 
@@ -100,11 +109,14 @@ impl ProxyInbound for Trojan {
         disp: &Dispatcher,
         policy: &Policy,
     ) -> io::Result<()> {
-        let users = self.users.clone();
-        let (dest, leftover) = read_header(&mut conn, policy.handshake, 16384, move |b| {
+        let users = self.users.load_full();
+        let ((dest, email), leftover) = read_header(&mut conn, policy.handshake, 16384, move |b| {
             parse(b, &users)
         })
         .await?;
+        let mut ctx = ctx.clone();
+        ctx.user_email = Some(email);
+        let ctx = &ctx;
         let timer = Timer::new(policy.idle);
         match dest.network {
             Network::Udp => {

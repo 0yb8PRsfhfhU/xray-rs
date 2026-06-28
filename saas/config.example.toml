@@ -1,0 +1,49 @@
+# xray-saas configuration — XrayR's config.yml translated to TOML.
+# Key names mirror XrayR exactly (PascalCase); unknown keys for out-of-scope
+# features (REALITY, fallback, limiter, custom DNS/inbound/outbound) are ignored.
+
+[Log]
+Level = "warning" # none, error, warning, info, debug
+
+[ConnectionConfig]
+Handshake = 4    # handshake read deadline, seconds
+ConnIdle = 30    # idle timeout, seconds
+UplinkOnly = 2
+DownlinkOnly = 4
+BufferSize = 64
+
+[[Nodes]]
+PanelType = "SSpanel" # only SSpanel is supported by this build
+
+[Nodes.ApiConfig]
+ApiHost = "http://127.0.0.1:667"
+ApiKey = "123"
+NodeID = 41
+# Node type: V2ray, Vmess, Vless, Trojan, Shadowsocks.
+# (Shadowsocks-Plugin, XTLS flows, REALITY, XHTTP and SS2022 are NOT supported.)
+NodeType = "V2ray"
+Timeout = 30
+EnableVless = false # serve V2ray nodes as VLESS (flow=none only)
+VlessFlow = ""      # XTLS/Vision flows are unsupported; leave empty
+SpeedLimit = 0.0    # Mbps, local override (0 = use panel value)
+DeviceLimit = 0     # local override (0 = use panel value)
+RuleListPath = ""
+DisableCustomConfig = false
+
+[Nodes.ControllerConfig]
+ListenIP = "0.0.0.0"
+SendIP = "0.0.0.0"
+UpdatePeriodic = 60 # node/user sync + traffic report interval, seconds
+EnableProxyProtocol = false
+DisableSniffing = false
+DisableUploadTraffic = false
+DisableGetRule = false
+DNSType = "AsIs"
+
+[Nodes.ControllerConfig.CertConfig]
+# Only "none" (no TLS) and "file" (operator-provided cert) are supported.
+# ACME modes (dns/http/tls) require external provisioning of CertFile/KeyFile.
+CertMode = "none"
+CertDomain = "node1.example.com"
+CertFile = "/etc/xray-saas/cert/node1.example.com.cert"
+KeyFile = "/etc/xray-saas/cert/node1.example.com.key"

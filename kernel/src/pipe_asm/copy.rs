@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::pipe_asm::pipe::Link;
 use crate::pipe_asm::timer::Timer;
+use crate::stats::Counter;
 
 /// Read window size handed to a single `read` (SPEC §2a, 8–64 KiB band).
 pub const READ_BUF: usize = 16384;
@@ -25,6 +26,7 @@ pub async fn conn_to_link<R>(
     mut reader: R,
     tx: mpsc::Sender<Bytes>,
     timer: &Timer,
+    counter: Option<&Counter>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -41,6 +43,9 @@ where
             return Ok(());
         }
         timer.update();
+        if let Some(c) = counter {
+            c.add_up(n as u64);
+        }
         if tx.send(buf.freeze()).await.is_err() {
             return Ok(());
         }
@@ -52,6 +57,7 @@ pub async fn link_to_conn<W>(
     mut rx: mpsc::Receiver<Bytes>,
     mut writer: W,
     timer: &Timer,
+    counter: Option<&Counter>,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -66,6 +72,9 @@ where
         match chunk {
             Some(b) => {
                 timer.update();
+                if let Some(c) = counter {
+                    c.add_down(b.len() as u64);
+                }
                 writer.write_all(&b).await?;
             }
             None => {
@@ -85,8 +94,8 @@ where
     let (r, w) = tokio::io::split(conn);
     let Link { reader, writer } = link;
     tokio::try_join!(
-        conn_to_link(r, writer, timer),
-        link_to_conn(reader, w, timer)
+        conn_to_link(r, writer, timer, None),
+        link_to_conn(reader, w, timer, None)
     )?;
     Ok(())
 }
@@ -110,6 +119,7 @@ pub async fn link_to_sink<W>(
     mut rx: mpsc::Receiver<Bytes>,
     mut w: W,
     timer: &Timer,
+    counter: Option<&Counter>,
 ) -> io::Result<()>
 where
     W: BytesSink,
@@ -127,7 +137,11 @@ where
                     continue;
                 }
                 timer.update();
+                let len = b.len();
                 w.send(b).await?;
+                if let Some(c) = counter {
+                    c.add_down(len as u64);
+                }
             }
             None => {
                 let _ = w.flush().await;
@@ -138,16 +152,23 @@ where
 }
 
 /// Run both copy directions over a split connection whose write half is a
-/// [`BytesSink`] (zero-copy downlink counterpart to [`splice`]).
-pub async fn splice_sink<R, W>(r: R, w: W, link: Link, timer: &Timer) -> io::Result<()>
+/// [`BytesSink`] (zero-copy downlink counterpart to [`splice`]). `counter`, when
+/// present, accumulates inbound per-user upload/download bytes.
+pub async fn splice_sink<R, W>(
+    r: R,
+    w: W,
+    link: Link,
+    timer: &Timer,
+    counter: Option<&Counter>,
+) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: BytesSink,
 {
     let Link { reader, writer } = link;
     tokio::try_join!(
-        conn_to_link(r, writer, timer),
-        link_to_sink(reader, w, timer)
+        conn_to_link(r, writer, timer, counter),
+        link_to_sink(reader, w, timer, counter)
     )?;
     Ok(())
 }
@@ -196,7 +217,7 @@ mod tests {
         link_tx.send(Bytes::from_static(b"beta")).await.unwrap();
         drop(link_tx); // EOF
 
-        link_to_sink(link_rx, CollectSink { tx: ev_tx }, &timer)
+        link_to_sink(link_rx, CollectSink { tx: ev_tx }, &timer, None)
             .await
             .unwrap();
 
@@ -230,7 +251,7 @@ mod tests {
 
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
         let uplink: &[u8] = b"up-bytes";
-        splice_sink(uplink, CollectSink { tx: ev_tx }, inbound, &timer)
+        splice_sink(uplink, CollectSink { tx: ev_tx }, inbound, &timer, None)
             .await
             .unwrap();
 
@@ -249,5 +270,40 @@ mod tests {
             up.extend_from_slice(&b);
         }
         assert_eq!(&up[..], b"up-bytes");
+    }
+
+    #[tokio::test]
+    async fn splice_sink_accounts_traffic() {
+        let timer = Timer::new(Duration::from_secs(60));
+        let (inbound, outbound) = pipe(8);
+        let Link {
+            reader: mut out_reader,
+            writer: out_writer,
+        } = outbound;
+
+        // Downlink: 5 + 5 = 10 bytes; uplink: 8 bytes.
+        out_writer.send(Bytes::from_static(b"down1")).await.unwrap();
+        out_writer.send(Bytes::from_static(b"down2")).await.unwrap();
+        drop(out_writer);
+
+        let counter = Counter::default();
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel::<Event>();
+        let uplink: &[u8] = b"up-bytes";
+        splice_sink(
+            uplink,
+            CollectSink { tx: ev_tx },
+            inbound,
+            &timer,
+            Some(&counter),
+        )
+        .await
+        .unwrap();
+        while out_reader.try_recv().is_ok() {}
+
+        assert_eq!(counter.up(), 8, "uplink bytes counted");
+        assert_eq!(counter.down(), 10, "downlink bytes counted");
+        let (up, down) = counter.take();
+        assert_eq!((up, down), (8, 10));
+        assert_eq!((counter.up(), counter.down()), (0, 0), "take resets");
     }
 }

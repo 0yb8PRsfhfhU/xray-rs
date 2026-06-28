@@ -395,7 +395,8 @@ impl GrpcWriteHalf {
                 continue;
             }
             let n = cap.min(data.len());
-            s.send_data(data.split_to(n), false).map_err(io::Error::other)?;
+            s.send_data(data.split_to(n), false)
+                .map_err(io::Error::other)?;
         }
         Ok(())
     }
@@ -785,7 +786,10 @@ mod tests {
                 got.extend_from_slice(&p);
             }
         }
-        assert_eq!(got, expected, "split header+payload frames must decode identically");
+        assert_eq!(
+            got, expected,
+            "split header+payload frames must decode identically"
+        );
 
         let _ = done_tx.send(());
         server.await.unwrap();

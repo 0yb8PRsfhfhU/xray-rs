@@ -18,6 +18,7 @@ pub struct Dispatcher {
     outbounds: HashMap<CompactString, Outbound>,
     default_tag: CompactString,
     router: Option<Router>,
+    stats: Option<std::sync::Arc<crate::stats::Stats>>,
 }
 
 impl Dispatcher {
@@ -32,7 +33,19 @@ impl Dispatcher {
             outbounds,
             default_tag: default_tag.into(),
             router,
+            stats: None,
         }
+    }
+
+    /// Attach a per-user traffic stats registry (SaaS panel integration).
+    pub fn with_stats(mut self, stats: std::sync::Arc<crate::stats::Stats>) -> Dispatcher {
+        self.stats = Some(stats);
+        self
+    }
+
+    /// The attached stats registry, if any.
+    pub fn stats(&self) -> Option<&std::sync::Arc<crate::stats::Stats>> {
+        self.stats.as_ref()
     }
 
     /// Convenience: a dispatcher with a single `freedom` outbound and no router.

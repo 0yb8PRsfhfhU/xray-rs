@@ -17,6 +17,7 @@
 pub mod controller;
 pub mod egress;
 pub mod pipe_asm;
+pub mod stats;
 pub mod types;
 
 pub use controller::dispatcher::Dispatcher;
@@ -30,6 +31,7 @@ pub use egress::outbound::Outbound;
 pub use pipe_asm::copy::{BytesSink, splice_sink};
 pub use pipe_asm::pipe::{Link, UdpLink, UdpPacket};
 pub use pipe_asm::timer::Timer;
+pub use stats::{Counter, Stats};
 pub use types::error::{Error, Result};
 pub use types::net::{AddrCodec, Address, Destination, Family, Network, PortOrder};
 pub use types::uuid::Uuid;

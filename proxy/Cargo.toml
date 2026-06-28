@@ -12,6 +12,7 @@ tokio-util.workspace = true
 futures.workspace = true
 bytes.workspace = true
 compact_str.workspace = true
+arc-swap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rand.workspace = true

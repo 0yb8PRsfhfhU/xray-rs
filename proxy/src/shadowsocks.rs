@@ -49,7 +49,23 @@ pub struct SsUser {
 /// Shadowsocks inbound handler.
 pub struct Shadowsocks {
     kind: AeadKind,
-    users: Arc<Vec<SsUser>>,
+    users: arc_swap::ArcSwap<Vec<SsUser>>,
+}
+
+/// Derive the per-user master keys for a method.
+fn build_ss_users<I>(kind: AeadKind, users: I) -> Vec<SsUser>
+where
+    I: IntoIterator<Item = (String, CompactString, u32)>,
+{
+    let ksize = kind.key_size();
+    users
+        .into_iter()
+        .map(|(pw, email, level)| SsUser {
+            master: Arc::from(evp_bytes_to_key(pw.as_bytes(), ksize)),
+            email,
+            level,
+        })
+        .collect()
 }
 
 impl Shadowsocks {
@@ -58,19 +74,18 @@ impl Shadowsocks {
     where
         I: IntoIterator<Item = (String, CompactString, u32)>,
     {
-        let ksize = kind.key_size();
-        let users = users
-            .into_iter()
-            .map(|(pw, email, level)| SsUser {
-                master: Arc::from(evp_bytes_to_key(pw.as_bytes(), ksize)),
-                email,
-                level,
-            })
-            .collect();
         Shadowsocks {
             kind,
-            users: Arc::new(users),
+            users: arc_swap::ArcSwap::from(Arc::new(build_ss_users(kind, users))),
         }
+    }
+
+    /// Swap in a new user table (live user sync, SPEC §P2).
+    pub fn set_users<I>(&self, users: I)
+    where
+        I: IntoIterator<Item = (String, CompactString, u32)>,
+    {
+        self.users.store(Arc::new(build_ss_users(self.kind, users)));
     }
 
     pub async fn process(
@@ -96,7 +111,8 @@ impl Shadowsocks {
 
         // Trial-decrypt the first length chunk to find the user.
         let mut matched = None;
-        for user in self.users.iter() {
+        let users = self.users.load_full();
+        for user in users.iter() {
             let mut subkey = vec![0u8; ksize];
             if hkdf_sha1(&user.master, &salt, SUBKEY_INFO, &mut subkey).is_err() {
                 continue;
@@ -114,6 +130,12 @@ impl Shadowsocks {
         }
         let (user, aead, mut nonce, lenpt) =
             matched.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ss auth failed"))?;
+        let mut ctx = ctx.clone();
+        ctx.user_email = Some(user.email.clone());
+        let ctx = &ctx;
+        let counter = ctx
+            .user_email()
+            .and_then(|e| disp.stats().map(|s| s.counter(e)));
 
         let length = chunk_len(&lenpt)?;
         let mut payct = vec![0u8; length.checked_add(TAG).unwrap_or(length)];
@@ -150,11 +172,15 @@ impl Shadowsocks {
             let _ = writer.send(leftover).await;
         }
 
+        let up_counter = counter.clone();
         let up = async move {
             loop {
                 match ss_read_chunk(&mut r, &aead, &mut nonce).await? {
                     Some(chunk) => {
                         timer.update();
+                        if let Some(c) = &up_counter {
+                            c.add_up(chunk.len() as u64);
+                        }
                         if writer.send(chunk).await.is_err() {
                             return io::Result::Ok(());
                         }
@@ -163,10 +189,14 @@ impl Shadowsocks {
                 }
             }
         };
+        let down_counter = counter.clone();
         let down = async move {
             let daead = daead;
             let mut dnonce = dnonce;
             while let Some(data) = reader.recv().await {
+                if let Some(c) = &down_counter {
+                    c.add_down(data.len() as u64);
+                }
                 ss_write_chunks(&mut w, &daead, &mut dnonce, &data).await?;
             }
             let _ = w.flush().await;
@@ -271,13 +301,14 @@ fn ss_udp_encode(
 
 impl Shadowsocks {
     /// Decode one SS UDP datagram: trial-decrypt with zero nonce, parse target.
-    fn udp_decode(&self, dgram: &[u8]) -> Option<(usize, Destination, Bytes)> {
+    fn udp_decode(&self, dgram: &[u8]) -> Option<(Arc<[u8]>, CompactString, Destination, Bytes)> {
         let ksize = self.kind.key_size();
         let nsize = self.kind.nonce_size();
         let (salt, ct) = dgram.split_at_checked(ksize)?;
         let zero = [0u8; 24];
         let nonce = zero.get(..nsize)?;
-        for (i, user) in self.users.iter().enumerate() {
+        let users = self.users.load();
+        for user in users.iter() {
             let mut subkey = vec![0u8; ksize];
             if hkdf_sha1(&user.master, salt, SUBKEY_INFO, &mut subkey).is_err() {
                 continue;
@@ -289,7 +320,12 @@ impl Shadowsocks {
             if let Ok(plain) = aead.open(nonce, ct) {
                 let mut pb = Bytes::from(plain);
                 if let Ok((address, port)) = AddrCodec::SHADOWSOCKS.read(&mut pb) {
-                    return Some((i, Destination::udp(address, port), pb));
+                    return Some((
+                        user.master.clone(),
+                        user.email.clone(),
+                        Destination::udp(address, port),
+                        pb,
+                    ));
                 }
             }
         }
@@ -304,7 +340,10 @@ impl Shadowsocks {
         disp: &Dispatcher,
         policy: &Policy,
     ) -> io::Result<()> {
-        let mut sessions: HashMap<SocketAddr, mpsc::Sender<UdpPacket>> = HashMap::new();
+        let mut sessions: HashMap<
+            SocketAddr,
+            (mpsc::Sender<UdpPacket>, Option<Arc<kernel::Counter>>),
+        > = HashMap::new();
         let (reap_tx, mut reap_rx) = mpsc::channel::<SocketAddr>(64);
         let mut buf = vec![0u8; 65535];
         loop {
@@ -312,33 +351,37 @@ impl Shadowsocks {
                 r = socket.recv_from(&mut buf) => {
                     let (n, from) = r?;
                     let dgram = buf.get(..n).unwrap_or(&[]);
-                    let (uidx, target, payload) = match self.udp_decode(dgram) {
+                    let (master, email, target, payload) = match self.udp_decode(dgram) {
                         Some(v) => v,
                         None => continue,
                     };
-                    let tx = if let Some(tx) = sessions.get(&from) {
-                        tx.clone()
+                    let (tx, counter) = if let Some((tx, c)) = sessions.get(&from) {
+                        (tx.clone(), c.clone())
                     } else {
-                        let master = match self.users.get(uidx) {
-                            Some(u) => u.master.clone(),
-                            None => continue,
-                        };
+                        let counter = disp.stats().map(|s| s.counter(&email));
                         let timer = Timer::new(policy.idle);
                         let UdpLink { mut reader, writer } = disp.dispatch_udp(ctx, timer);
                         let sock = socket.clone();
                         let kind = self.kind;
                         let reap = reap_tx.clone();
+                        let down_counter = counter.clone();
                         tokio::spawn(async move {
                             while let Some(pkt) = reader.recv().await {
+                                if let Some(c) = &down_counter {
+                                    c.add_down(pkt.data.len() as u64);
+                                }
                                 if let Some(d) = ss_udp_encode(kind, &master, &pkt.target, &pkt.data) {
                                     let _ = sock.send_to(&d, from).await;
                                 }
                             }
                             let _ = reap.send(from).await;
                         });
-                        sessions.insert(from, writer.clone());
-                        writer
+                        sessions.insert(from, (writer.clone(), counter.clone()));
+                        (writer, counter)
                     };
+                    if let Some(c) = &counter {
+                        c.add_up(payload.len() as u64);
+                    }
                     let _ = tx.send(UdpPacket { data: payload, target }).await;
                 }
                 Some(dead) = reap_rx.recv() => {

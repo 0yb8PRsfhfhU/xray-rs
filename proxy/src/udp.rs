@@ -78,11 +78,17 @@ pub async fn relay_trojan_udp(
     let mut framed = Framed::new(r, leftover);
     let kernel::UdpLink { mut reader, writer } = link;
     let token = timer.token();
+    let counter = ctx
+        .user_email()
+        .and_then(|e| disp.stats().map(|s| s.counter(e)));
 
     let up = async {
         loop {
             let (target, payload) = framed.frame(parse_trojan_packet).await?;
             timer.update();
+            if let Some(c) = &counter {
+                c.add_up(payload.len() as u64);
+            }
             if writer
                 .send(UdpPacket {
                     data: payload,
@@ -99,6 +105,9 @@ pub async fn relay_trojan_udp(
     let down = async {
         while let Some(pkt) = reader.recv().await {
             timer.update();
+            if let Some(c) = &counter {
+                c.add_down(pkt.data.len() as u64);
+            }
             let len = match u16::try_from(pkt.data.len()) {
                 Ok(l) => l,
                 Err(_) => continue,
@@ -142,12 +151,18 @@ pub async fn relay_vless_udp(
     let mut framed = Framed::new(r, leftover);
     let kernel::UdpLink { mut reader, writer } = link;
     let token = timer.token();
+    let counter = ctx
+        .user_email()
+        .and_then(|e| disp.stats().map(|s| s.counter(e)));
     let target = Destination::udp(hdr.address, hdr.port);
 
     let up = async {
         loop {
             let payload = framed.frame(parse_vless_packet).await?;
             timer.update();
+            if let Some(c) = &counter {
+                c.add_up(payload.len() as u64);
+            }
             if writer
                 .send(UdpPacket {
                     data: payload,
@@ -164,6 +179,9 @@ pub async fn relay_vless_udp(
     let down = async {
         while let Some(pkt) = reader.recv().await {
             timer.update();
+            if let Some(c) = &counter {
+                c.add_down(pkt.data.len() as u64);
+            }
             let len = match u16::try_from(pkt.data.len()) {
                 Ok(l) => l,
                 Err(_) => continue,
