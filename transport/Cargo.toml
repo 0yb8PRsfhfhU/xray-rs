@@ -4,6 +4,10 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# Statically link OpenSSL (compiled from source) for portable binaries.
+vendored = ["openssl/vendored"]
+
 [dependencies]
 kernel.workspace = true
 tokio.workspace = true

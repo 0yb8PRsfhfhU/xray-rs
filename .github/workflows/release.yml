@@ -1,0 +1,73 @@
+name: Release
+
+# Builds two portable Linux binaries against the GNU/glibc target (not musl):
+#   * xray-rs   — the simple server         (crate: app)
+#   * xray-saas — the SaaS / panel server   (crate: saas)
+# OpenSSL is statically vendored (feature `vendored`), so the binaries only
+# depend on the system glibc — portable across mainstream glibc distros.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    name: Build portable binaries (x86_64-unknown-linux-gnu)
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The Go submodules (Xray-core, XrayR) are reference-only; not needed to build.
+          submodules: false
+
+      - name: Set up Rust (honors rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add "$TARGET"
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+
+      - name: Build simple binary (xray-rs)
+        run: cargo build --release --locked --target "$TARGET" -p app --features vendored
+
+      - name: Build SaaS binary (xray-saas)
+        run: cargo build --release --locked --target "$TARGET" -p saas --features vendored
+
+      - name: Collect, strip, and checksum binaries
+        run: |
+          mkdir -p dist
+          install -m 0755 "target/$TARGET/release/xray-rs"   "dist/xray-rs-$TARGET"
+          install -m 0755 "target/$TARGET/release/xray-saas" "dist/xray-saas-$TARGET"
+          strip "dist/xray-rs-$TARGET" "dist/xray-saas-$TARGET"
+          ( cd dist && sha256sum xray-rs-$TARGET xray-saas-$TARGET > SHA256SUMS )
+          ls -la dist
+          echo "--- shared library deps (expect glibc only, no libssl/libcrypto) ---"
+          ldd "dist/xray-rs-$TARGET"   || true
+          ldd "dist/xray-saas-$TARGET" || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-binaries-${{ env.TARGET }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

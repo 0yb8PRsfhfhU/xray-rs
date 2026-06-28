@@ -8,6 +8,10 @@ license.workspace = true
 name = "xray-rs"
 path = "src/main.rs"
 
+[features]
+# Statically link OpenSSL for a portable binary.
+vendored = ["transport/vendored"]
+
 [dependencies]
 kernel.workspace = true
 proxy.workspace = true

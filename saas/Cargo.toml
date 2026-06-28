@@ -8,6 +8,10 @@ license.workspace = true
 name = "xray-saas"
 path = "src/main.rs"
 
+[features]
+# Statically link OpenSSL (transport TLS + reqwest native-tls) for a portable binary.
+vendored = ["transport/vendored"]
+
 [dependencies]
 kernel.workspace = true
 proxy.workspace = true
@@ -38,3 +42,6 @@ hex.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+
+[profile.release]
+lto = true
