@@ -48,7 +48,7 @@ impl SystemDialer {
             Address::Domain(d) => {
                 let ips = self.resolver.resolve(d).await?;
                 let socket_addrs = ips
-                    .into_iter()
+                    .iter()
                     .map(|ip| SocketAddr::new(*ip, dest.port))
                     .collect();
                 Ok(socket_addrs)

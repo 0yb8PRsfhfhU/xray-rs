@@ -27,6 +27,7 @@ pub use controller::sniff::{SniffedProtocol, sniff, sniff_http, sniff_tls};
 pub use egress::dialer::SystemDialer;
 pub use egress::dns::CachedResolver;
 pub use egress::outbound::Outbound;
+pub use pipe_asm::copy::{BytesSink, splice_sink};
 pub use pipe_asm::pipe::{Link, UdpLink, UdpPacket};
 pub use pipe_asm::timer::Timer;
 pub use types::error::{Error, Result};

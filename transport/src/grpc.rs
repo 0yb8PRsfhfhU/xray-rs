@@ -209,6 +209,46 @@ impl<S> GrpcStream<S> {
     }
 }
 
+/// Read half of a split [`GrpcStream`]: decodes inbound `Hunk` frames, draining
+/// any residual / partially-buffered bytes first. Holds an `Arc` clone of the
+/// driver shutdown signal so the connection task outlives both halves.
+pub struct GrpcReadHalf {
+    recv: RecvStream,
+    recv_buf: BytesMut,
+    pending: Bytes,
+    eof: bool,
+    _signal: std::sync::Arc<oneshot::Sender<()>>,
+}
+
+/// Write half of a split [`GrpcStream`]: frames each owned [`Bytes`] payload as
+/// a `Hunk`, splitting (not copying) it across flow-control windows (SPEC §P3).
+pub struct GrpcWriteHalf {
+    send: SendStream<Bytes>,
+    _signal: std::sync::Arc<oneshot::Sender<()>>,
+}
+
+impl<S> GrpcStream<S> {
+    /// Split into independent read / write halves, carrying buffered inbound
+    /// state into the read half and sharing the driver shutdown signal so the
+    /// connection task lives until both halves drop.
+    pub fn into_split(self) -> (GrpcReadHalf, GrpcWriteHalf) {
+        let sig = std::sync::Arc::new(self._signal);
+        (
+            GrpcReadHalf {
+                recv: self.recv,
+                recv_buf: self.recv_buf,
+                pending: self.pending,
+                eof: self.eof,
+                _signal: sig.clone(),
+            },
+            GrpcWriteHalf {
+                send: self.send,
+                _signal: sig,
+            },
+        )
+    }
+}
+
 impl<S> AsyncRead for GrpcStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -285,25 +325,107 @@ impl<S> AsyncWrite for GrpcStream<S> {
     }
 }
 
-/// Encode `payload` as one gRPC-framed `Hunk` message:
-/// `0x00 | u32be(len) | 0x0A | varint(payload.len) | payload`.
-fn encode_hunk(payload: &[u8]) -> io::Result<Bytes> {
-    let payload_len = payload.len();
-    let vlen = varint_len(payload_len as u64);
+impl AsyncRead for GrpcReadHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        loop {
+            if !me.pending.is_empty() {
+                let n = me.pending.len().min(buf.remaining());
+                let chunk = me.pending.split_to(n);
+                buf.put_slice(&chunk);
+                return Poll::Ready(Ok(()));
+            }
+            if let Some(payload) = try_decode(&mut me.recv_buf)? {
+                me.pending = payload;
+                continue;
+            }
+            if me.eof {
+                return Poll::Ready(Ok(()));
+            }
+            match ready!(me.recv.poll_data(cx)) {
+                Some(Ok(data)) => {
+                    let len = data.len();
+                    me.recv_buf.extend_from_slice(&data);
+                    let _ = me.recv.flow_control().release_capacity(len);
+                }
+                Some(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+                None => me.eof = true,
+            }
+        }
+    }
+}
+
+impl GrpcWriteHalf {
+    /// Frame and send one `Hunk` payload: the small header then the payload as
+    /// separate `send_data` calls (byte-identical to [`encode_hunk`] on the
+    /// wire), splitting the owned payload across flow-control windows.
+    pub async fn send(&mut self, payload: Bytes) -> io::Result<()> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+        let header = grpc_header(payload.len())?;
+        Self::send_all(&mut self.send, header).await?;
+        Self::send_all(&mut self.send, payload).await
+    }
+
+    /// No-op: the connection-driver task writes queued `DATA` frames; there is
+    /// no adapter-side buffer to flush.
+    pub async fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Send all of `data`, awaiting flow-control capacity (async mirror of
+    /// [`GrpcStream::flush_write_buf`]); splits `data` in place, never copies.
+    async fn send_all(s: &mut SendStream<Bytes>, mut data: Bytes) -> io::Result<()> {
+        while !data.is_empty() {
+            s.reserve_capacity(data.len());
+            let cap = match s.capacity() {
+                0 => match std::future::poll_fn(|cx| s.poll_capacity(cx)).await {
+                    Some(Ok(c)) => c,
+                    Some(Err(e)) => return Err(io::Error::other(e)),
+                    None => return Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+                },
+                c => c,
+            };
+            if cap == 0 {
+                continue;
+            }
+            let n = cap.min(data.len());
+            s.send_data(data.split_to(n), false).map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+}
+
+/// Build the gRPC frame + `Hunk` header for a payload of `payload_len` bytes:
+/// `0x00 | u32be(proto_len) | 0x0A | varint(payload_len)`. The payload follows.
+fn grpc_header(payload_len: usize) -> io::Result<Bytes> {
     let overflow = || io::Error::new(io::ErrorKind::InvalidData, "grpc: frame length overflow");
+    let vlen = varint_len(payload_len as u64);
     // protobuf message length = tag(1) + varint(len) + payload
     let proto_len = 1usize
         .checked_add(vlen)
         .and_then(|x| x.checked_add(payload_len))
         .ok_or_else(overflow)?;
     let proto_len_u32: u32 = proto_len.try_into().map_err(|_| overflow())?;
-    let total = proto_len.checked_add(5).ok_or_else(overflow)?;
+    let mut h = BytesMut::with_capacity(5usize.saturating_add(vlen));
+    h.put_u8(0); // compression flag: uncompressed
+    h.put_u32(proto_len_u32); // gRPC message length, big-endian
+    h.put_u8(0x0A); // Hunk field #1, wire type 2 (length-delimited)
+    put_varint(&mut h, payload_len as u64);
+    Ok(h.freeze())
+}
 
-    let mut out = BytesMut::with_capacity(total);
-    out.put_u8(0); // compression flag: uncompressed
-    out.put_u32(proto_len_u32); // gRPC message length, big-endian
-    out.put_u8(0x0A); // Hunk field #1, wire type 2 (length-delimited)
-    put_varint(&mut out, payload_len as u64);
+/// Encode `payload` as one gRPC-framed `Hunk` message:
+/// `0x00 | u32be(len) | 0x0A | varint(payload.len) | payload`.
+fn encode_hunk(payload: &[u8]) -> io::Result<Bytes> {
+    let header = grpc_header(payload.len())?;
+    let mut out = BytesMut::with_capacity(header.len().saturating_add(payload.len()));
+    out.put_slice(&header);
     out.put_slice(payload);
     Ok(out.freeze())
 }
@@ -588,6 +710,84 @@ mod tests {
 
         // End the client's send half so the server's drain completes.
         body_out.send_data(Bytes::new(), true).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_half_frames_chunks_decodable_by_h2_client() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Chunks pushed through the split write half. The empty one must produce
+        // no frame; the 32 KiB one must survive flow-control chunking. Expected
+        // decoded output = concatenation of the non-empty chunks.
+        let chunks: Vec<Bytes> = vec![
+            Bytes::from_static(b"alpha"),
+            Bytes::new(),
+            Bytes::from(vec![0xABu8; 32 * 1024]),
+        ];
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"alpha");
+        expected.extend_from_slice(&[0xABu8; 32 * 1024]);
+
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn({
+            let chunks = chunks.clone();
+            async move {
+                let (sock, _) = listener.accept().await.unwrap();
+                let cfg = GrpcConfig {
+                    service_name: "GunService".into(),
+                };
+                let stream = accept(RawNetworkStream::Tcp(sock), &cfg).await.unwrap();
+                let (read, mut write) = stream.into_split();
+                for chunk in chunks {
+                    write.send(chunk).await.unwrap();
+                }
+                // Hold both halves (keeping the driver and send stream alive)
+                // until the client confirms it has received everything.
+                let _ = done_rx.await;
+                drop(write);
+                drop(read);
+            }
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (mut send_req, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let request = http::Request::builder()
+            .method(Method::POST)
+            .uri("http://localhost/GunService/Tun")
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .body(())
+            .unwrap();
+        let (resp, _body_out) = send_req.send_request(request, false).unwrap();
+
+        let response = resp.await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        let mut body_in = response.into_body();
+        let mut acc = BytesMut::new();
+        let mut got = Vec::new();
+        while got.len() < expected.len() {
+            let Some(data) = body_in.data().await else {
+                break;
+            };
+            let data = data.unwrap();
+            let _ = body_in.flow_control().release_capacity(data.len());
+            acc.extend_from_slice(&data);
+            while let Some(p) = try_decode(&mut acc).unwrap() {
+                got.extend_from_slice(&p);
+            }
+        }
+        assert_eq!(got, expected, "split header+payload frames must decode identically");
+
+        let _ = done_tx.send(());
         server.await.unwrap();
     }
 }

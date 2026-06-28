@@ -25,7 +25,7 @@ use tokio::net::TcpStream;
 pub use grpc::GrpcConfig;
 pub use httpupgrade::HttpUpgradeConfig;
 pub use listener::{SocketOpts, bind_tcp};
-pub use stream::Stream;
+pub use stream::{Stream, StreamReadHalf, StreamWriteHalf};
 pub use tls::TlsServer;
 pub use ws::{WsConfig, WsStream};
 

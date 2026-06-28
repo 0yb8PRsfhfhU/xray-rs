@@ -59,7 +59,7 @@ impl Dispatcher {
             if let Some(tag) = router.pick(&rc)
                 && let Some(ob) = self.outbounds.get(tag)
             {
-                return ob.clone();
+                return *ob;
             }
         }
         self.outbounds

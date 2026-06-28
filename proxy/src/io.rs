@@ -5,11 +5,12 @@ use std::io;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::timeout;
 
 use kernel::types::error::Error;
 use kernel::{Ctx, Destination, Dispatcher, Timer};
+use transport::Stream;
 
 /// Read and parse a protocol header off `conn` under a handshake deadline.
 ///
@@ -64,17 +65,14 @@ where
 
 /// Dispatch a TCP flow and pump bytes, forwarding any already-read `leftover`
 /// payload first.
-pub async fn relay_tcp<S>(
-    conn: S,
+pub async fn relay_tcp(
+    conn: Stream,
     dest: Destination,
     leftover: Bytes,
     ctx: &Ctx,
     disp: &Dispatcher,
     timer: Timer,
-) -> io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) -> io::Result<()> {
     let sniffed = if leftover.is_empty() {
         None
     } else {
@@ -87,5 +85,6 @@ where
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "outbound closed"))?;
     }
-    kernel::pipe_asm::copy::splice(conn, link, &timer).await
+    let (r, w) = conn.into_split();
+    kernel::splice_sink(r, w, link, &timer).await
 }

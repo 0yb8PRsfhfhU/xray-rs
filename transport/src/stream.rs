@@ -12,8 +12,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_openssl::SslStream;
 
-use crate::grpc::GrpcStream;
-use crate::ws::WsStream;
+use crate::grpc::{GrpcReadHalf, GrpcStream, GrpcWriteHalf};
+use crate::ws::{WsReadHalf, WsStream, WsWriteHalf};
 
 /// The transport-security layer.
 pub enum RawNetworkStream {
@@ -108,6 +108,75 @@ impl AsyncWrite for Stream {
             Stream::Raw(s) => Pin::new(s).poll_shutdown(cx),
             Stream::Ws(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
             Stream::Grpc(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Read half of a split [`Stream`] (SPEC §P1 sum).
+pub enum StreamReadHalf {
+    Raw(tokio::io::ReadHalf<RawNetworkStream>),
+    Ws(WsReadHalf<RawNetworkStream>),
+    Grpc(GrpcReadHalf),
+}
+
+/// Write half of a split [`Stream`]: a [`kernel::BytesSink`] so the downlink
+/// hands owned [`Bytes`] to WS / gRPC frames without a copy (SPEC §P3).
+pub enum StreamWriteHalf {
+    Raw(tokio::io::WriteHalf<RawNetworkStream>),
+    Ws(WsWriteHalf<RawNetworkStream>),
+    Grpc(GrpcWriteHalf),
+}
+
+impl Stream {
+    /// Split into independent read / write halves for the relay copy loops.
+    /// `Raw` uses `tokio::io::split`; WS / gRPC use their transport-owned splits
+    /// that preserve buffered inbound state and a zero-copy write path.
+    pub fn into_split(self) -> (StreamReadHalf, StreamWriteHalf) {
+        match self {
+            Stream::Raw(raw) => {
+                let (r, w) = tokio::io::split(raw);
+                (StreamReadHalf::Raw(r), StreamWriteHalf::Raw(w))
+            }
+            Stream::Ws(ws) => {
+                let (r, w) = (*ws).into_split();
+                (StreamReadHalf::Ws(r), StreamWriteHalf::Ws(w))
+            }
+            Stream::Grpc(g) => {
+                let (r, w) = (*g).into_split();
+                (StreamReadHalf::Grpc(r), StreamWriteHalf::Grpc(w))
+            }
+        }
+    }
+}
+
+impl AsyncRead for StreamReadHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            StreamReadHalf::Raw(s) => Pin::new(s).poll_read(cx, buf),
+            StreamReadHalf::Ws(s) => Pin::new(s).poll_read(cx, buf),
+            StreamReadHalf::Grpc(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl kernel::BytesSink for StreamWriteHalf {
+    async fn send(&mut self, buf: bytes::Bytes) -> io::Result<()> {
+        match self {
+            StreamWriteHalf::Raw(w) => tokio::io::AsyncWriteExt::write_all(w, &buf).await,
+            StreamWriteHalf::Ws(w) => w.send(buf).await,
+            StreamWriteHalf::Grpc(w) => w.send(buf).await,
+        }
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        match self {
+            StreamWriteHalf::Raw(w) => tokio::io::AsyncWriteExt::flush(w).await,
+            StreamWriteHalf::Ws(w) => w.flush().await,
+            StreamWriteHalf::Grpc(w) => w.flush().await,
         }
     }
 }

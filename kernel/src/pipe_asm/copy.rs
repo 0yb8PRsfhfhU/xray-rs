@@ -90,3 +90,164 @@ where
     )?;
     Ok(())
 }
+
+/// Write side that accepts owned [`Bytes`] chunks without an intermediate copy
+/// (SPEC §P3). Transports whose wire write takes an owned buffer (WebSocket
+/// binary frames, h2 `DATA`) implement this so the downlink hands the original
+/// `Bytes` straight through. `+ Send` is explicit because the relay future is
+/// spawned.
+pub trait BytesSink: Send {
+    /// Write one chunk, taking ownership.
+    fn send(&mut self, buf: Bytes) -> impl core::future::Future<Output = io::Result<()>> + Send;
+    /// Flush any buffered bytes to the peer.
+    fn flush(&mut self) -> impl core::future::Future<Output = io::Result<()>> + Send;
+}
+
+/// Pump link `rx` → sink `w`, moving each [`Bytes`] chunk through [`BytesSink`]
+/// (downlink counterpart to [`link_to_conn`]). Empty chunks are dropped so a
+/// frame-oriented sink never emits an empty frame. `Ok(())` on sender drop (EOF).
+pub async fn link_to_sink<W>(
+    mut rx: mpsc::Receiver<Bytes>,
+    mut w: W,
+    timer: &Timer,
+) -> io::Result<()>
+where
+    W: BytesSink,
+{
+    let token = timer.token();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = token.cancelled() => return Err(idle_err()),
+            c = rx.recv() => c,
+        };
+        match chunk {
+            Some(b) => {
+                if b.is_empty() {
+                    continue;
+                }
+                timer.update();
+                w.send(b).await?;
+            }
+            None => {
+                let _ = w.flush().await;
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Run both copy directions over a split connection whose write half is a
+/// [`BytesSink`] (zero-copy downlink counterpart to [`splice`]).
+pub async fn splice_sink<R, W>(r: R, w: W, link: Link, timer: &Timer) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: BytesSink,
+{
+    let Link { reader, writer } = link;
+    tokio::try_join!(
+        conn_to_link(r, writer, timer),
+        link_to_sink(reader, w, timer)
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod tests {
+    use super::*;
+    use crate::pipe_asm::pipe::pipe;
+    use std::time::Duration;
+
+    /// Test sink: forwards each event over an unbounded channel so the test can
+    /// inspect order / flush after the sink is consumed by the copy loop.
+    enum Event {
+        Chunk(Bytes),
+        Flush,
+    }
+
+    struct CollectSink {
+        tx: mpsc::UnboundedSender<Event>,
+    }
+
+    impl BytesSink for CollectSink {
+        async fn send(&mut self, buf: Bytes) -> io::Result<()> {
+            let _ = self.tx.send(Event::Chunk(buf));
+            Ok(())
+        }
+        async fn flush(&mut self) -> io::Result<()> {
+            let _ = self.tx.send(Event::Flush);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn link_to_sink_orders_drops_empty_and_flushes_on_eof() {
+        let timer = Timer::new(Duration::from_secs(60));
+        let (link_tx, link_rx) = mpsc::channel::<Bytes>(8);
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
+
+        link_tx.send(Bytes::from_static(b"alpha")).await.unwrap();
+        link_tx.send(Bytes::new()).await.unwrap(); // empty must be dropped
+        link_tx.send(Bytes::from_static(b"beta")).await.unwrap();
+        drop(link_tx); // EOF
+
+        link_to_sink(link_rx, CollectSink { tx: ev_tx }, &timer)
+            .await
+            .unwrap();
+
+        let mut chunks = Vec::new();
+        let mut flushed = false;
+        while let Ok(ev) = ev_rx.try_recv() {
+            match ev {
+                Event::Chunk(b) => chunks.push(b),
+                Event::Flush => flushed = true,
+            }
+        }
+        assert_eq!(chunks.len(), 2, "empty chunk must be dropped");
+        assert_eq!(&chunks[0][..], b"alpha");
+        assert_eq!(&chunks[1][..], b"beta");
+        assert!(flushed, "EOF must trigger flush");
+    }
+
+    #[tokio::test]
+    async fn splice_sink_pumps_both_directions() {
+        let timer = Timer::new(Duration::from_secs(60));
+        let (inbound, outbound) = pipe(8);
+        let Link {
+            reader: mut out_reader,
+            writer: out_writer,
+        } = outbound;
+
+        // Downlink: outbound side writes two chunks then closes.
+        out_writer.send(Bytes::from_static(b"down1")).await.unwrap();
+        out_writer.send(Bytes::from_static(b"down2")).await.unwrap();
+        drop(out_writer);
+
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
+        let uplink: &[u8] = b"up-bytes";
+        splice_sink(uplink, CollectSink { tx: ev_tx }, inbound, &timer)
+            .await
+            .unwrap();
+
+        // Downlink reached the sink in order.
+        let mut down = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            if let Event::Chunk(b) = ev {
+                down.extend_from_slice(&b);
+            }
+        }
+        assert_eq!(&down[..], b"down1down2");
+
+        // Uplink reached the outbound reader.
+        let mut up = Vec::new();
+        while let Ok(b) = out_reader.try_recv() {
+            up.extend_from_slice(&b);
+        }
+        assert_eq!(&up[..], b"up-bytes");
+    }
+}
