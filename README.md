@@ -174,7 +174,3 @@ Intentionally not implemented (mirrors `SPEC.md` priorities): REALITY, XTLS Visi
 XHTTP/SplitHTTP (the h3 leg requires `quinn` + `h3`), Shadowsocks-2022, hot config reload,
 and stats export. These are noted where an inbound would otherwise reuse a shared codec;
 they are not stubbed to look complete.
-
-## License
-
-MIT.

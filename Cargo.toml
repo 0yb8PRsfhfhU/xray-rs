@@ -4,8 +4,8 @@ members = ["kernel", "proxy", "transport", "app", "saas"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
-license = "MIT"
+version = "0.1.1"
+license = "unfree"
 
 [workspace.dependencies]
 # internal
