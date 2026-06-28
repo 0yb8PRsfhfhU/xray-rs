@@ -73,7 +73,7 @@ hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
 serde_json = "1"
 regex = "1"
-sysinfo = "0.37"
+sysinfo = "0.39"
 
 [profile.release]
 lto = true
