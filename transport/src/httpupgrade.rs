@@ -4,7 +4,6 @@
 
 use std::io;
 
-use crate::{Transport, stream::RawNetworkStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Server httpupgrade settings.
@@ -12,13 +11,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub struct HttpUpgradeConfig {
     pub path: String,
     pub host: Option<String>,
-}
-
-impl Transport for HttpUpgradeConfig {
-    type Stream = RawNetworkStream;
-    async fn accept(&self, stream: RawNetworkStream) -> io::Result<RawNetworkStream> {
-        accept(stream, self).await
-    }
 }
 
 const MAX_HEAD: usize = 16384;

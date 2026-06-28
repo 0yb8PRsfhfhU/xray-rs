@@ -45,14 +45,6 @@ pub enum TransportKind {
     Grpc(Arc<GrpcConfig>),
 }
 
-pub trait Transport {
-    type Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static;
-    fn accept(
-        &self,
-        stream: stream::RawNetworkStream,
-    ) -> impl Future<Output = std::io::Result<Self::Stream>> + Send;
-}
-
 /// Full inbound stream configuration: security + transport.
 #[derive(Clone)]
 pub struct StreamConfig {
@@ -69,33 +61,28 @@ impl StreamConfig {
     }
 }
 
-impl Transport for TransportKind {
-    type Stream = Stream;
-    async fn accept(&self, raw: stream::RawNetworkStream) -> std::io::Result<Stream> {
-        match self {
-            TransportKind::Raw => Ok(Stream::Raw(raw)),
-            TransportKind::Ws(cfg) => {
-                let ws = ws::accept(raw, cfg).await?;
-                Ok(Stream::Ws(Box::new(ws)))
-            }
-            TransportKind::HttpUpgrade(cfg) => {
-                let raw = httpupgrade::accept(raw, cfg).await?;
-                Ok(Stream::Raw(raw))
-            }
-            TransportKind::Grpc(cfg) => {
-                let grpc = grpc::accept(raw, cfg).await?;
-                Ok(Stream::Grpc(Box::new(grpc)))
-            }
-        }
-    }
+/// One accepted connection. Raw / websocket / httpupgrade map one TCP/TLS
+/// connection to exactly one logical stream; gRPC multiplexes many `Tun` streams
+/// over one HTTP/2 connection, delivered as they arrive.
+pub enum Accepted {
+    Single(Stream),
+    Multiplexed(tokio::sync::mpsc::Receiver<Stream>),
 }
 
-/// Apply security then transport to an accepted TCP connection, producing the
-/// composed [`Stream`] handed to an inbound handler.
-pub async fn accept_stream(tcp: TcpStream, cfg: &StreamConfig) -> std::io::Result<Stream> {
+/// Apply security then transport to an accepted TCP connection. Raw / websocket
+/// / httpupgrade yield a single composed [`Stream`]; gRPC yields a receiver of
+/// streams multiplexed over one HTTP/2 connection.
+pub async fn accept_conn(tcp: TcpStream, cfg: &StreamConfig) -> std::io::Result<Accepted> {
     let raw = match &cfg.security {
         Security::None => stream::RawNetworkStream::Tcp(tcp),
         Security::Tls(server) => stream::RawNetworkStream::Tls(Box::new(server.accept(tcp).await?)),
     };
-    cfg.transport.accept(raw).await
+    Ok(match &cfg.transport {
+        TransportKind::Raw => Accepted::Single(Stream::Raw(raw)),
+        TransportKind::Ws(c) => Accepted::Single(Stream::Ws(Box::new(ws::accept(raw, c).await?))),
+        TransportKind::HttpUpgrade(c) => {
+            Accepted::Single(httpupgrade::accept(raw, c).await?.into())
+        }
+        TransportKind::Grpc(c) => Accepted::Multiplexed(grpc::serve(raw, c).await?),
+    })
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use kernel::{Ctx, Dispatcher, Policy};
 use proxy::ProxyInbound;
-use transport::{SocketOpts, accept_stream, bind_tcp};
+use transport::{Accepted, SocketOpts, accept_conn, bind_tcp};
 
 use crate::config::{Built, InboundInstance};
 
@@ -88,16 +88,29 @@ async fn serve(ib: InboundInstance, disp: Arc<Dispatcher>, policy: Policy) -> Re
         let stream_cfg = stream_cfg.clone();
         let tag = tag.clone();
         tokio::spawn(async move {
-            let stream = match accept_stream(tcp, &stream_cfg).await {
-                Ok(s) => s,
+            match accept_conn(tcp, &stream_cfg).await {
+                Ok(Accepted::Single(stream)) => {
+                    let ctx = Ctx::new(tag, Some(peer));
+                    if let Err(e) = handler.serve(&ctx, stream, &disp, &policy).await {
+                        tracing::debug!(session = ctx.id, error = %e, "connection ended");
+                    }
+                }
+                Ok(Accepted::Multiplexed(mut rx)) => {
+                    while let Some(stream) = rx.recv().await {
+                        let handler = handler.clone();
+                        let disp = disp.clone();
+                        let tag = tag.clone();
+                        tokio::spawn(async move {
+                            let ctx = Ctx::new(tag, Some(peer));
+                            if let Err(e) = handler.serve(&ctx, stream, &disp, &policy).await {
+                                tracing::debug!(session = ctx.id, error = %e, "connection ended");
+                            }
+                        });
+                    }
+                }
                 Err(e) => {
                     tracing::debug!(error = %e, "stream setup failed");
-                    return;
                 }
-            };
-            let ctx = Ctx::new(tag, Some(peer));
-            if let Err(e) = handler.serve(&ctx, stream, &disp, &policy).await {
-                tracing::debug!(session = ctx.id, error = %e, "connection ended");
             }
         });
     }

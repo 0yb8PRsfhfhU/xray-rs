@@ -6,7 +6,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 
-use crate::{Transport, stream::RawNetworkStream};
 use base64::Engine;
 use bytes::Bytes;
 use futures::sink::Sink;
@@ -22,13 +21,6 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 pub struct WsConfig {
     pub path: String,
     pub host: Option<String>,
-}
-
-impl Transport for WsConfig {
-    type Stream = WsStream<RawNetworkStream>;
-    async fn accept(&self, stream: RawNetworkStream) -> io::Result<WsStream<RawNetworkStream>> {
-        accept(stream, self).await
-    }
 }
 
 /// Adapter exposing a WebSocket stream as a byte stream.

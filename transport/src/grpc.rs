@@ -26,10 +26,9 @@ use h2::{RecvStream, SendStream, server};
 use http::{HeaderMap, HeaderValue, Method, Response};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 
-use crate::Transport;
-use crate::stream::RawNetworkStream;
+use crate::stream::{RawNetworkStream, Stream};
 
 /// Reject any single gRPC message claiming more than this many bytes. Real
 /// xray peers frame small buffers (bounded by the HTTP/2 flow-control window);
@@ -46,40 +45,56 @@ pub struct GrpcConfig {
     pub service_name: String,
 }
 
-impl Transport for GrpcConfig {
-    type Stream = GrpcStream<RawNetworkStream>;
-    async fn accept(&self, stream: RawNetworkStream) -> io::Result<GrpcStream<RawNetworkStream>> {
-        accept(stream, self).await
-    }
+/// Channel depth for streams handed off to the listener. The listener drains
+/// each immediately (spawns a serve task), so this only absorbs short bursts of
+/// concurrent new streams; it never gates steady-state I/O.
+const STREAM_CHANNEL_CAP: usize = 256;
+
+/// Perform the server-side gRPC (HTTP/2) handshake over `raw`, then accept every
+/// `Tun` stream multiplexed on the connection, delivering each as a [`Stream`].
+/// The spawned task drives the whole HTTP/2 connection (polling `accept`
+/// advances all in-flight streams) and lives until the client closes it; a
+/// rejected request resets only its own stream, never the shared connection.
+pub async fn serve(raw: RawNetworkStream, cfg: &GrpcConfig) -> io::Result<mpsc::Receiver<Stream>> {
+    let mut conn = server::handshake(raw).await.map_err(io::Error::other)?;
+    let (tx, rx) = mpsc::channel::<Stream>(STREAM_CHANNEL_CAP);
+    let service = cfg.service_name.clone();
+    tokio::spawn(async move {
+        loop {
+            let (request, mut respond) = match conn.accept().await {
+                Some(Ok(pair)) => pair,
+                Some(Err(_)) => break,
+                None => break,
+            };
+            match accept_request(request, &mut respond, &service) {
+                Ok(grpc) => {
+                    if tx.send(Stream::Grpc(Box::new(grpc))).await.is_err() {
+                        break; // listener dropped the receiver
+                    }
+                }
+                Err(_) => respond.send_reset(h2::Reason::REFUSED_STREAM),
+            }
+        }
+    });
+    Ok(rx)
 }
 
-/// Perform the server-side gRPC (HTTP/2) handshake over `raw`, accept the
-/// `Tun` stream, send the `200 application/grpc` response head, and return a
-/// byte-stream adapter over the tunnel.
-pub async fn accept(
-    raw: RawNetworkStream,
-    cfg: &GrpcConfig,
+/// Validate one inbound `Tun` request and send the `200 application/grpc` head,
+/// returning a byte-stream adapter over the tunnel. Free of `.await`, so the
+/// accept loop re-parks in `conn.accept()` promptly, keeping the connection
+/// driven for sibling streams.
+fn accept_request(
+    request: http::Request<RecvStream>,
+    respond: &mut server::SendResponse<Bytes>,
+    service: &str,
 ) -> io::Result<GrpcStream<RawNetworkStream>> {
-    let mut conn = server::handshake(raw).await.map_err(io::Error::other)?;
-
-    let (request, mut respond) = match conn.accept().await {
-        Some(Ok(pair)) => pair,
-        Some(Err(e)) => return Err(io::Error::other(e)),
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "grpc: no request",
-            ));
-        }
-    };
-
     if request.method() != Method::POST {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "grpc: expected POST",
         ));
     }
-    if !path_matches(request.uri().path(), &cfg.service_name) {
+    if !path_matches(request.uri().path(), service) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "grpc: unexpected path",
@@ -110,23 +125,7 @@ pub async fn accept(
 
     tracing::debug!("grpc: accepted Tun stream");
 
-    // Drive the HTTP/2 connection from a dedicated task. `signal` lets the
-    // adapter request a graceful shutdown when it is dropped, bounding the
-    // task's lifetime instead of waiting for the client to close.
-    let (signal, mut shutdown) = oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let mut requested = false;
-        let _ = std::future::poll_fn(move |cx| {
-            if !requested && Pin::new(&mut shutdown).poll(cx).is_ready() {
-                requested = true;
-                conn.graceful_shutdown();
-            }
-            conn.poll_closed(cx).map(drop)
-        })
-        .await;
-    });
-
-    Ok(GrpcStream::new(send, recv, signal))
+    Ok(GrpcStream::new(send, recv))
 }
 
 /// Percent-escape one path segment the way Go's `url.PathEscape` does
@@ -189,7 +188,7 @@ fn path_matches(path: &str, service: &str) -> bool {
 /// Inbound HTTP/2 `DATA` is decoded from `Hunk` frames (reassembling frames
 /// split across `DATA` frames); outbound bytes are wrapped one `Hunk` per
 /// write. `S` tags the underlying transport; the socket itself is owned by the
-/// connection-driver task spawned in [`accept`].
+/// connection-driver task spawned in [`serve`].
 pub struct GrpcStream<S> {
     send: SendStream<Bytes>,
     recv: RecvStream,
@@ -203,17 +202,11 @@ pub struct GrpcStream<S> {
     eof: bool,
     /// Closing trailer already queued.
     trailers_sent: bool,
-    /// Dropped on teardown to signal the driver task to shut down.
-    _signal: oneshot::Sender<()>,
     _marker: PhantomData<fn() -> S>,
 }
 
 impl<S> GrpcStream<S> {
-    fn new(
-        send: SendStream<Bytes>,
-        recv: RecvStream,
-        signal: oneshot::Sender<()>,
-    ) -> GrpcStream<S> {
+    fn new(send: SendStream<Bytes>, recv: RecvStream) -> GrpcStream<S> {
         GrpcStream {
             send,
             recv,
@@ -222,7 +215,6 @@ impl<S> GrpcStream<S> {
             write_buf: Bytes::new(),
             eof: false,
             trailers_sent: false,
-            _signal: signal,
             _marker: PhantomData,
         }
     }
@@ -254,41 +246,32 @@ impl<S> GrpcStream<S> {
 }
 
 /// Read half of a split [`GrpcStream`]: decodes inbound `Hunk` frames, draining
-/// any residual / partially-buffered bytes first. Holds an `Arc` clone of the
-/// driver shutdown signal so the connection task outlives both halves.
+/// any residual / partially-buffered bytes first.
 pub struct GrpcReadHalf {
     recv: RecvStream,
     recv_buf: BytesMut,
     pending: Bytes,
     eof: bool,
-    _signal: std::sync::Arc<oneshot::Sender<()>>,
 }
 
 /// Write half of a split [`GrpcStream`]: frames each owned [`Bytes`] payload as
 /// a `Hunk`, splitting (not copying) it across flow-control windows (SPEC §P3).
 pub struct GrpcWriteHalf {
     send: SendStream<Bytes>,
-    _signal: std::sync::Arc<oneshot::Sender<()>>,
 }
 
 impl<S> GrpcStream<S> {
     /// Split into independent read / write halves, carrying buffered inbound
-    /// state into the read half and sharing the driver shutdown signal so the
-    /// connection task lives until both halves drop.
+    /// state into the read half.
     pub fn into_split(self) -> (GrpcReadHalf, GrpcWriteHalf) {
-        let sig = std::sync::Arc::new(self._signal);
         (
             GrpcReadHalf {
                 recv: self.recv,
                 recv_buf: self.recv_buf,
                 pending: self.pending,
                 eof: self.eof,
-                _signal: sig.clone(),
             },
-            GrpcWriteHalf {
-                send: self.send,
-                _signal: sig,
-            },
+            GrpcWriteHalf { send: self.send },
         )
     }
 }
@@ -599,10 +582,13 @@ fn put_varint(out: &mut BytesMut, mut v: u64) {
 #[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
-    clippy::arithmetic_side_effects
+    clippy::arithmetic_side_effects,
+    clippy::panic,
+    clippy::unreachable
 )]
 mod tests {
     use super::*;
+    use tokio::sync::oneshot;
 
     #[test]
     fn assert_send_unpin() {
@@ -712,7 +698,11 @@ mod tests {
             let cfg = GrpcConfig {
                 service_name: "GunService".into(),
             };
-            let mut stream = accept(RawNetworkStream::Tcp(sock), &cfg).await.unwrap();
+            let mut rx = serve(RawNetworkStream::Tcp(sock), &cfg).await.unwrap();
+            let Stream::Grpc(g) = rx.recv().await.unwrap() else {
+                unreachable!()
+            };
+            let mut stream = *g;
             let mut buf = [0u8; 64];
             let n = stream.read(&mut buf).await.unwrap();
             stream.write_all(&buf[..n]).await.unwrap();
@@ -798,7 +788,11 @@ mod tests {
                 let cfg = GrpcConfig {
                     service_name: "GunService".into(),
                 };
-                let stream = accept(RawNetworkStream::Tcp(sock), &cfg).await.unwrap();
+                let mut rx = serve(RawNetworkStream::Tcp(sock), &cfg).await.unwrap();
+                let Stream::Grpc(g) = rx.recv().await.unwrap() else {
+                    unreachable!()
+                };
+                let stream = *g;
                 let (read, mut write) = stream.into_split();
                 for chunk in chunks {
                     write.send(chunk).await.unwrap();
@@ -848,6 +842,108 @@ mod tests {
         );
 
         let _ = done_tx.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_concurrent_streams_each_served() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server: accept the gRPC connection and spawn one echo task per Tun
+        // stream. Serving the second stream (not just the first) is what proves
+        // the multiplexing fix; the serve task keeps driving both in-flight
+        // streams while parked in `accept()`.
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let cfg = GrpcConfig {
+                service_name: "GunService".into(),
+            };
+            let mut rx = serve(RawNetworkStream::Tcp(sock), &cfg).await.unwrap();
+            let mut tasks = Vec::new();
+            while let Some(stream) = rx.recv().await {
+                let Stream::Grpc(g) = stream else {
+                    unreachable!()
+                };
+                tasks.push(tokio::spawn(async move {
+                    let mut s = *g;
+                    let mut buf = [0u8; 64];
+                    let n = s.read(&mut buf).await.unwrap();
+                    s.write_all(&buf[..n]).await.unwrap();
+                    s.shutdown().await.unwrap();
+                    let mut rest = Vec::new();
+                    let _ = s.read_to_end(&mut rest).await;
+                }));
+                if tasks.len() == 2 {
+                    break;
+                }
+            }
+            for t in tasks {
+                t.await.unwrap();
+            }
+        });
+
+        // Client: one h2 connection multiplexing two Tun streams, each carrying
+        // a distinct payload.
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (mut send_req, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let p1 = b"first-stream-payload";
+        let p2 = b"second-stream-payload";
+
+        let req1 = http::Request::builder()
+            .method(Method::POST)
+            .uri("http://localhost/GunService/Tun")
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .body(())
+            .unwrap();
+        let (resp1, mut out1) = send_req.send_request(req1, false).unwrap();
+        out1.send_data(encode_hunk(p1).unwrap(), false).unwrap();
+
+        let req2 = http::Request::builder()
+            .method(Method::POST)
+            .uri("http://localhost/GunService/Tun")
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .body(())
+            .unwrap();
+        let (resp2, mut out2) = send_req.send_request(req2, false).unwrap();
+        out2.send_data(encode_hunk(p2).unwrap(), false).unwrap();
+
+        async fn read_echo(mut body_in: RecvStream) -> Vec<u8> {
+            let mut acc = BytesMut::new();
+            let mut got = Vec::new();
+            while let Some(data) = body_in.data().await {
+                let data = data.unwrap();
+                let _ = body_in.flow_control().release_capacity(data.len());
+                acc.extend_from_slice(&data);
+                while let Some(p) = try_decode(&mut acc).unwrap() {
+                    got.extend_from_slice(&p);
+                }
+            }
+            got
+        }
+
+        let response1 = resp1.await.unwrap();
+        assert_eq!(response1.status(), http::StatusCode::OK);
+        let response2 = resp2.await.unwrap();
+        assert_eq!(response2.status(), http::StatusCode::OK);
+
+        let g1 = read_echo(response1.into_body()).await;
+        let g2 = read_echo(response2.into_body()).await;
+        assert_eq!(&g1[..], p1, "first stream must echo its own payload");
+        assert_eq!(&g2[..], p2, "second multiplexed stream must also be served");
+
+        // End both client send halves so each server echo task's drain
+        // completes, then drop the client to close the connection.
+        out1.send_data(Bytes::new(), true).unwrap();
+        out2.send_data(Bytes::new(), true).unwrap();
+        drop(send_req);
         server.await.unwrap();
     }
 }
