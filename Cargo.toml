@@ -41,6 +41,7 @@ hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http = "1"
 h2 = "0.4"
+percent-encoding = "2"
 
 # crypto
 aes-gcm = "0.10"

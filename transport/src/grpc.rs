@@ -24,6 +24,7 @@ use std::task::{Context, Poll, ready};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use h2::{RecvStream, SendStream, server};
 use http::{HeaderMap, HeaderValue, Method, Response};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::oneshot;
 
@@ -38,8 +39,10 @@ const MAX_FRAME: usize = 16_777_216;
 /// Server gRPC transport settings.
 #[derive(Debug, Clone, Default)]
 pub struct GrpcConfig {
-    /// gRPC service name. The accepted path is `/<service_name>/Tun`. When
-    /// empty, any service name is accepted (the path need only address `/Tun`).
+    /// gRPC service name, matched exactly as Xray-core constructs the request
+    /// path (`Config.getServiceName`/`getTunStreamName`): the accepted path is
+    /// `/<service_name>/Tun` for an ordinary name, or the custom path encoded by
+    /// a value beginning with `/` (see [`grpc_path_parts`]).
     pub service_name: String,
 }
 
@@ -126,18 +129,59 @@ pub async fn accept(
     Ok(GrpcStream::new(send, recv, signal))
 }
 
-/// Match an inbound request path against the configured service name. The path
-/// must address the `Tun` method (end with `/Tun`); when `service` is set, the
-/// preceding segment must name that service.
-fn path_matches(path: &str, service: &str) -> bool {
-    let Some(prefix) = path.strip_suffix("/Tun") else {
-        return false;
+/// Percent-escape one path segment the way Go's `url.PathEscape` does
+/// (`encodePathSegment`): keep alphanumerics, the unreserved marks `-_.~`, and
+/// the reserved characters allowed unescaped in a path segment (`$&+:=@`);
+/// escape everything else (notably `/`, space, `!`, `|`, …). Xray-core runs the
+/// configured service name through this before placing it on the wire, so the
+/// server must escape identically to compare.
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'+')
+    .remove(b':')
+    .remove(b'=')
+    .remove(b'@');
+
+fn path_escape(s: &str) -> String {
+    utf8_percent_encode(s, PATH_SEGMENT).to_string()
+}
+
+/// Split a configured service name into the `(service, tunStream)` path
+/// segments a gRPC client addresses, reproducing Xray-core's
+/// `Config.getServiceName` + `getTunStreamName`
+/// (`transport/internet/grpc/config.go`).
+///
+/// - An ordinary name (no leading `/`) escapes whole and uses the `Tun` method:
+///   `"GunService"` → `("GunService", "Tun")`.
+/// - A value beginning with `/` is a custom path `"/<svc…>/<tun>[|<tunMulti>]"`:
+///   each `/`-separated service part is escaped and rejoined, and the trailing
+///   segment (before any `|`) is the Tun method —
+///   `"/my/path/a|b"` → `("my/path", "a")`.
+fn grpc_path_parts(service: &str) -> (String, String) {
+    let Some(after) = service.strip_prefix('/') else {
+        return (path_escape(service), String::from("Tun"));
     };
-    if service.is_empty() {
-        return true;
-    }
-    let svc = prefix.strip_prefix('/').unwrap_or(prefix);
-    svc == service || prefix.ends_with(service)
+    let (raw_svc, ending) = after.rsplit_once('/').unwrap_or(("", after));
+    let svc = raw_svc
+        .split('/')
+        .map(path_escape)
+        .collect::<Vec<_>>()
+        .join("/");
+    let tun = path_escape(ending.split('|').next().unwrap_or(ending));
+    (svc, tun)
+}
+
+/// Accept an inbound request path iff it is exactly the `/<service>/<tunStream>`
+/// path the configured service name produces — the same equality grpc-go
+/// enforces against its registered service descriptor.
+fn path_matches(path: &str, service: &str) -> bool {
+    let (svc, tun) = grpc_path_parts(service);
+    path == format!("/{svc}/{tun}")
 }
 
 /// A byte stream tunnelled over a gRPC `Tun` bidirectional stream.
@@ -634,11 +678,23 @@ mod tests {
 
     #[test]
     fn path_matching() {
+        // Ordinary service name: "/<serviceName>/Tun".
         assert!(path_matches("/GunService/Tun", "GunService"));
-        assert!(path_matches("/anything/Tun", ""));
         assert!(!path_matches("/GunService/Tun", "Other"));
-        assert!(!path_matches("/GunService/TunMulti", "GunService"));
-        assert!(!path_matches("/GunService", "GunService"));
+        assert!(!path_matches("/GunService", "GunService")); // missing method
+        assert!(!path_matches("/GunService/TunMulti", "GunService")); // multi unsupported
+
+        // Empty name maps to "//Tun" exactly (matching Xray-core), not a wildcard.
+        assert!(path_matches("//Tun", ""));
+        assert!(!path_matches("/anything/Tun", ""));
+
+        // url.PathEscape of special characters (Xray-core config_test.go vectors).
+        assert!(path_matches("/hello%2Fworld%21/Tun", "hello/world!"));
+
+        // Custom absolute path "/<svc…>/<tun>[|<tunMulti>]".
+        assert!(path_matches("/my/sample/path/a", "/my/sample/path/a|b"));
+        assert!(path_matches("//foo", "/foo")); // single '/': empty service segment
+        assert!(path_matches("/hello%20/world%21/a", "/hello /world!/a|b"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
