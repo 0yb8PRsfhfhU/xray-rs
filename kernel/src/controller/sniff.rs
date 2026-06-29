@@ -25,6 +25,16 @@ pub enum SniffedProtocol {
     Http,
 }
 
+impl SniffedProtocol {
+    /// The routing-rule protocol token, matching Xray's sniffer names.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SniffedProtocol::Tls => "tls",
+            SniffedProtocol::Http => "http",
+        }
+    }
+}
+
 /// Sniff a connection prefix, trying TLS first and then HTTP.
 ///
 /// Returns the recognised protocol together with the domain the client is

@@ -11,7 +11,7 @@ use crate::pipe_asm::timer::Timer;
 use crate::types::net::{Address, Destination};
 
 /// Closed sum of server outbounds.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Outbound {
     /// Direct outbound: dial the real target and forward bytes.
     Freedom,

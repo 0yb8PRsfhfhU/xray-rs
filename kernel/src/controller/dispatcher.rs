@@ -59,7 +59,13 @@ impl Dispatcher {
         &self.dialer
     }
 
-    fn select(&self, ctx: &Ctx, dest: &Destination, sniffed: Option<&str>) -> Outbound {
+    fn select(
+        &self,
+        ctx: &Ctx,
+        dest: &Destination,
+        sniffed: Option<&str>,
+        protocol: Option<&str>,
+    ) -> Outbound {
         if let Some(router) = &self.router {
             let rc = RouteCtx {
                 network: dest.network,
@@ -67,12 +73,12 @@ impl Dispatcher {
                 inbound_tag: &ctx.inbound_tag,
                 source: ctx.source.map(|s| s.ip()),
                 sniffed_domain: sniffed,
-                protocol: None,
+                protocol,
             };
             if let Some(tag) = router.pick(&rc)
                 && let Some(ob) = self.outbounds.get(tag)
             {
-                return *ob;
+                return ob.clone();
             }
         }
         self.outbounds
@@ -83,7 +89,7 @@ impl Dispatcher {
 
     /// Dispatch a TCP flow to `dest`; returns the inbound half of the pipe.
     pub fn dispatch_tcp(&self, ctx: &Ctx, dest: Destination, timer: Timer) -> Link {
-        self.dispatch_tcp_sniffed(ctx, dest, None, timer)
+        self.dispatch_tcp_sniffed(ctx, dest, None, None, timer)
     }
 
     /// Dispatch a TCP flow with an optional sniffed domain used for routing.
@@ -92,10 +98,11 @@ impl Dispatcher {
         ctx: &Ctx,
         dest: Destination,
         sniffed: Option<&str>,
+        protocol: Option<&str>,
         timer: Timer,
     ) -> Link {
         let (inbound, outbound_half) = pipe(LINK_CAPACITY);
-        let ob = self.select(ctx, &dest, sniffed);
+        let ob = self.select(ctx, &dest, sniffed, protocol);
         let dialer = self.dialer.clone();
         let id = ctx.id;
         tracing::debug!(session = id, dest = %dest, "dispatch tcp");

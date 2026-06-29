@@ -73,12 +73,14 @@ pub async fn relay_tcp(
     disp: &Dispatcher,
     timer: Timer,
 ) -> io::Result<()> {
-    let sniffed = if leftover.is_empty() {
+    let sniff_result = if leftover.is_empty() {
         None
     } else {
-        kernel::controller::sniff::sniff(&leftover).map(|(_, domain)| domain)
+        kernel::controller::sniff::sniff(&leftover)
     };
-    let link = disp.dispatch_tcp_sniffed(ctx, dest, sniffed.as_deref(), timer.clone());
+    let sniffed_domain = sniff_result.as_ref().map(|(_, domain)| domain.as_str());
+    let sniffed_proto = sniff_result.as_ref().map(|(proto, _)| proto.as_str());
+    let link = disp.dispatch_tcp_sniffed(ctx, dest, sniffed_domain, sniffed_proto, timer.clone());
     if !leftover.is_empty() {
         link.writer
             .send(leftover)
