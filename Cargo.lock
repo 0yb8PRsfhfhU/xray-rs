@@ -1296,6 +1296,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
+name = "new_kernel"
+version = "0.1.1-alpha"
+dependencies = [
+ "aes-gcm",
+ "arc-swap",
+ "bytes",
+ "chacha20poly1305",
+ "compact_str",
+ "futures",
+ "hickory-resolver",
+ "hkdf",
+ "md-5",
+ "moka",
+ "parking_lot",
+ "rand 0.10.1",
+ "sha1 0.11.0",
+ "sha2",
+ "smallvec",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ntapi"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2243,6 +2270,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

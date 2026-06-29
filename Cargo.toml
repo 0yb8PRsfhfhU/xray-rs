@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "proxy", "transport", "app", "saas"]
+members = ["kernel", "proxy", "transport", "app", "saas", "new_kernel"]
 
 [workspace.package]
 edition = "2024"
@@ -14,7 +14,7 @@ proxy = { path = "proxy" }
 transport = { path = "transport" }
 
 # runtime
-tokio = { version = "1.44", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
+tokio = { version = "1.44", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 futures = "0.3"
 bytes = "1"
