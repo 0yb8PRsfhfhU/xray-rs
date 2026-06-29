@@ -87,9 +87,13 @@ pub async fn relay_tcp(
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "outbound closed"))?;
     }
-    let counter = ctx
-        .user_email()
-        .and_then(|e| disp.stats().map(|s| s.counter(e)));
+    let counter_maybe = if let Some(ref user_email) = ctx.user_email
+        && let Some(stats) = disp.stats()
+    {
+        Some(stats.counter(user_email).await)
+    } else {
+        None
+    };
     let (r, w) = conn.into_split();
-    kernel::splice_sink(r, w, link, &timer, counter.as_deref()).await
+    kernel::splice_sink(r, w, link, &timer, counter_maybe.as_deref()).await
 }

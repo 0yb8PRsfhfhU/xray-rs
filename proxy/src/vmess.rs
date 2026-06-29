@@ -595,15 +595,19 @@ impl Vmess {
         }
 
         let timer = Timer::new(policy.idle);
-        let counter = ctx
-            .user_email()
-            .and_then(|e| disp.stats().map(|s| s.counter(e)));
+        let maybe_counter = if let Some(stats) = disp.stats()
+            && let Some(ref user_email) = ctx.user_email
+        {
+            Some(stats.counter(user_email).await)
+        } else {
+            None
+        };
         let link = disp.dispatch_tcp(ctx, req.dest, timer.clone());
         let kernel::Link { mut reader, writer } = link;
         let (mut r, mut w) = tokio::io::split(conn);
         let token = timer.token();
 
-        let up_counter = counter.clone();
+        let up_counter = maybe_counter.clone();
         let up_loop = async move {
             loop {
                 match read_chunk(&mut r, &mut up).await? {
@@ -621,7 +625,7 @@ impl Vmess {
                 }
             }
         };
-        let down_counter = counter.clone();
+        let down_counter = maybe_counter.clone();
         let down_loop = async move {
             while let Some(data) = reader.recv().await {
                 if let Some(c) = &down_counter {

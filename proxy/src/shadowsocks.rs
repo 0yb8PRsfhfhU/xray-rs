@@ -133,9 +133,13 @@ impl Shadowsocks {
         let mut ctx = ctx.clone();
         ctx.user_email = Some(user.email.clone());
         let ctx = &ctx;
-        let counter = ctx
-            .user_email()
-            .and_then(|e| disp.stats().map(|s| s.counter(e)));
+        let maybe_counter = if let Some(ref user_email) = ctx.user_email
+            && let Some(stats) = disp.stats()
+        {
+            Some(stats.counter(user_email).await)
+        } else {
+            None
+        };
 
         let length = chunk_len(&lenpt)?;
         let mut payct = vec![0u8; length.checked_add(TAG).unwrap_or(length)];
@@ -172,7 +176,7 @@ impl Shadowsocks {
             let _ = writer.send(leftover).await;
         }
 
-        let up_counter = counter.clone();
+        let up_counter = maybe_counter.clone();
         let up = async move {
             loop {
                 match ss_read_chunk(&mut r, &aead, &mut nonce).await? {
@@ -189,7 +193,7 @@ impl Shadowsocks {
                 }
             }
         };
-        let down_counter = counter.clone();
+        let down_counter = maybe_counter.clone();
         let down = async move {
             let daead = daead;
             let mut dnonce = dnonce;
@@ -358,13 +362,18 @@ impl Shadowsocks {
                     let (tx, counter) = if let Some((tx, c)) = sessions.get(&from) {
                         (tx.clone(), c.clone())
                     } else {
-                        let counter = disp.stats().map(|s| s.counter(&email));
+                        let maybe_counter =
+                            if let Some(stats) = disp.stats() {
+                                Some(stats.counter(&email).await)
+                            } else {
+                                None
+                            };
                         let timer = Timer::new(policy.idle);
                         let UdpLink { mut reader, writer } = disp.dispatch_udp(ctx, timer);
                         let sock = socket.clone();
                         let kind = self.kind;
                         let reap = reap_tx.clone();
-                        let down_counter = counter.clone();
+                        let down_counter = maybe_counter.clone();
                         tokio::spawn(async move {
                             while let Some(pkt) = reader.recv().await {
                                 if let Some(c) = &down_counter {
@@ -376,8 +385,8 @@ impl Shadowsocks {
                             }
                             let _ = reap.send(from).await;
                         });
-                        sessions.insert(from, (writer.clone(), counter.clone()));
-                        (writer, counter)
+                        sessions.insert(from, (writer.clone(), maybe_counter.clone()));
+                        (writer, maybe_counter)
                     };
                     if let Some(c) = &counter {
                         c.add_up(payload.len() as u64);

@@ -168,7 +168,7 @@ impl Controller {
                 }
             };
             self.ibm.remove(&old_tag);
-            self.prune_all_stats(&old_tag);
+            self.prune_all_stats(&old_tag).await;
 
             let built = match build_inbound(&node, &users, &self.cfg.listen_ip, &self.cfg.cert) {
                 Ok(b) => b,
@@ -223,7 +223,7 @@ impl Controller {
                 tracing::error!(error = %e, "syncing users failed");
                 return;
             }
-            self.prune_removed_stats(&users);
+            self.prune_removed_stats(&users).await;
             tracing::info!(tag = %self.node_tag, count = users.len(), "user list synced");
             self.user_list = users;
         }
@@ -265,7 +265,7 @@ impl Controller {
         let mut taken: Vec<(Arc<kernel::Counter>, u64, u64)> = Vec::new();
         for u in &self.user_list {
             let tag = build_user_tag(&self.node_tag, u);
-            if let Some(counter) = self.stats.get(&tag) {
+            if let Some(counter) = self.stats.get(&tag).await {
                 let (up, down) = counter.take();
                 if up > 0 || down > 0 {
                     traffic.push(UserTraffic {
@@ -304,7 +304,7 @@ impl Controller {
     }
 
     /// Drop stats counters for users removed since the last sync.
-    fn prune_removed_stats(&self, new_users: &[UserInfo]) {
+    async fn prune_removed_stats(&self, new_users: &[UserInfo]) {
         let keep: HashSet<CompactString> = new_users
             .iter()
             .map(|u| build_user_tag(&self.node_tag, u))
@@ -312,15 +312,15 @@ impl Controller {
         for u in &self.user_list {
             let tag = build_user_tag(&self.node_tag, u);
             if !keep.contains(&tag) {
-                self.stats.remove(&tag);
+                self.stats.remove(&tag).await;
             }
         }
     }
 
     /// Drop all stats counters for the current user set under `tag` (node change).
-    fn prune_all_stats(&self, tag: &str) {
+    async fn prune_all_stats(&self, tag: &str) {
         for u in &self.user_list {
-            self.stats.remove(&build_user_tag(tag, u));
+            self.stats.remove(&build_user_tag(tag, u)).await;
         }
     }
 }

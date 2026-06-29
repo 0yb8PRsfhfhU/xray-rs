@@ -78,15 +78,19 @@ pub async fn relay_trojan_udp(
     let mut framed = Framed::new(r, leftover);
     let kernel::UdpLink { mut reader, writer } = link;
     let token = timer.token();
-    let counter = ctx
-        .user_email()
-        .and_then(|e| disp.stats().map(|s| s.counter(e)));
+    let maybe_counter = if let Some(ref user_email) = ctx.user_email
+        && let Some(stats) = disp.stats()
+    {
+        Some(stats.counter(user_email).await)
+    } else {
+        None
+    };
 
     let up = async {
         loop {
             let (target, payload) = framed.frame(parse_trojan_packet).await?;
             timer.update();
-            if let Some(c) = &counter {
+            if let Some(c) = &maybe_counter {
                 c.add_up(payload.len() as u64);
             }
             if writer
@@ -105,7 +109,7 @@ pub async fn relay_trojan_udp(
     let down = async {
         while let Some(pkt) = reader.recv().await {
             timer.update();
-            if let Some(c) = &counter {
+            if let Some(c) = &maybe_counter {
                 c.add_down(pkt.data.len() as u64);
             }
             let len = match u16::try_from(pkt.data.len()) {
@@ -151,16 +155,20 @@ pub async fn relay_vless_udp(
     let mut framed = Framed::new(r, leftover);
     let kernel::UdpLink { mut reader, writer } = link;
     let token = timer.token();
-    let counter = ctx
-        .user_email()
-        .and_then(|e| disp.stats().map(|s| s.counter(e)));
+    let maybe_counter = if let Some(ref user_email) = ctx.user_email
+        && let Some(stats) = disp.stats()
+    {
+        Some(stats.counter(user_email).await)
+    } else {
+        None
+    };
     let target = Destination::udp(hdr.address, hdr.port);
 
     let up = async {
         loop {
             let payload = framed.frame(parse_vless_packet).await?;
             timer.update();
-            if let Some(c) = &counter {
+            if let Some(c) = &maybe_counter {
                 c.add_up(payload.len() as u64);
             }
             if writer
@@ -179,7 +187,7 @@ pub async fn relay_vless_udp(
     let down = async {
         while let Some(pkt) = reader.recv().await {
             timer.update();
-            if let Some(c) = &counter {
+            if let Some(c) = &maybe_counter {
                 c.add_down(pkt.data.len() as u64);
             }
             let len = match u16::try_from(pkt.data.len()) {

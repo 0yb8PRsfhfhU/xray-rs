@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use compact_str::CompactString;
-use parking_lot::Mutex;
+use tokio::sync::RwLock;
 
 /// Lock-free upload/download byte counter for a single user.
 #[derive(Debug, Default)]
@@ -59,7 +59,7 @@ impl Counter {
 /// (`{inbound_tag}|{email}|{uid}`, matching XrayR's traffic counter names).
 #[derive(Debug, Default)]
 pub struct Stats {
-    users: Mutex<HashMap<CompactString, Arc<Counter>>>,
+    users: RwLock<HashMap<CompactString, Arc<Counter>>>,
 }
 
 impl Stats {
@@ -68,8 +68,8 @@ impl Stats {
     }
 
     /// Get (or create) the counter for `tag`.
-    pub fn counter(&self, tag: &str) -> Arc<Counter> {
-        let mut guard = self.users.lock();
+    pub async fn counter(&self, tag: &str) -> Arc<Counter> {
+        let mut guard = self.users.write().await;
         if let Some(c) = guard.get(tag) {
             return c.clone();
         }
@@ -79,12 +79,12 @@ impl Stats {
     }
 
     /// Look up an existing counter without creating one.
-    pub fn get(&self, tag: &str) -> Option<Arc<Counter>> {
-        self.users.lock().get(tag).cloned()
+    pub async fn get(&self, tag: &str) -> Option<Arc<Counter>> {
+        self.users.read().await.get(tag).cloned()
     }
 
     /// Drop a user's counter (on user removal).
-    pub fn remove(&self, tag: &str) {
-        self.users.lock().remove(tag);
+    pub async fn remove(&self, tag: &str) {
+        self.users.write().await.remove(tag);
     }
 }
