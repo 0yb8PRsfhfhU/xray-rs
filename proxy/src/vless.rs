@@ -121,8 +121,7 @@ impl Vless {
         .await?;
         // Response header: version 0, zero-length addons.
         conn.write_all(&[0u8, 0u8]).await?;
-        let mut ctx = ctx.clone();
-        ctx.user_email = Some(email);
+        let ctx = ctx.with_user(email);
         let ctx = &ctx;
         match req {
             VlessReq::Tcp(dest) => {

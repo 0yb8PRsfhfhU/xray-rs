@@ -39,4 +39,13 @@ impl Ctx {
     pub fn user_email(&self) -> Option<&str> {
         self.user_email.as_deref()
     }
+
+    /// Clone the context with `user_email` set, attributing the session to an
+    /// authenticated user after the handler decodes its header (SPEC §2f).
+    pub fn with_user(&self, email: impl Into<CompactString>) -> Ctx {
+        Ctx {
+            user_email: Some(email.into()),
+            ..self.clone()
+        }
+    }
 }

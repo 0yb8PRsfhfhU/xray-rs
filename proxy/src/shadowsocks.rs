@@ -19,6 +19,7 @@ use kernel::{Ctx, Destination, Dispatcher, Policy, Timer, UdpLink, UdpPacket};
 use transport::Stream;
 
 use crate::crypto::{Aead, AeadKind, NonceCtr, evp_bytes_to_key, hkdf_sha1};
+use crate::io::{ChunkRead, ChunkWrite, relay_framed, user_counter};
 use crate::{ProxyInbound, UdpProxyInbound};
 
 const TAG: usize = AeadKind::TAG;
@@ -130,16 +131,9 @@ impl Shadowsocks {
         }
         let (user, aead, mut nonce, lenpt) =
             matched.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ss auth failed"))?;
-        let mut ctx = ctx.clone();
-        ctx.user_email = Some(user.email.clone());
+        let ctx = ctx.with_user(user.email.clone());
         let ctx = &ctx;
-        let maybe_counter = if let Some(ref user_email) = ctx.user_email
-            && let Some(stats) = disp.stats()
-        {
-            Some(stats.counter(user_email).await)
-        } else {
-            None
-        };
+        let counter = user_counter(ctx, disp).await;
 
         let length = chunk_len(&lenpt)?;
         let mut payct = vec![0u8; length.checked_add(TAG).unwrap_or(length)];
@@ -168,50 +162,19 @@ impl Shadowsocks {
 
         let timer = Timer::new(policy.idle);
         let link = disp.dispatch_tcp(ctx, dest, timer.clone());
-        let kernel::Link { mut reader, writer } = link;
-        let (mut r, mut w) = tokio::io::split(conn);
-        let token = timer.token();
-
-        if !leftover.is_empty() {
-            let _ = writer.send(leftover).await;
-        }
-
-        let up_counter = maybe_counter.clone();
-        let up = async move {
-            loop {
-                match ss_read_chunk(&mut r, &aead, &mut nonce).await? {
-                    Some(chunk) => {
-                        timer.update();
-                        if let Some(c) = &up_counter {
-                            c.add_up(chunk.len() as u64);
-                        }
-                        if writer.send(chunk).await.is_err() {
-                            return io::Result::Ok(());
-                        }
-                    }
-                    None => return io::Result::Ok(()),
-                }
-            }
-        };
-        let down_counter = maybe_counter.clone();
-        let down = async move {
-            let daead = daead;
-            let mut dnonce = dnonce;
-            while let Some(data) = reader.recv().await {
-                if let Some(c) = &down_counter {
-                    c.add_down(data.len() as u64);
-                }
-                ss_write_chunks(&mut w, &daead, &mut dnonce, &data).await?;
-            }
-            let _ = w.flush().await;
-            io::Result::Ok(())
-        };
-
-        tokio::select! {
-            _ = token.cancelled() => Err(io::Error::new(io::ErrorKind::TimedOut, "idle")),
-            r = up => r,
-            r = down => r,
-        }
+        relay_framed(
+            conn,
+            SsChunks { aead, nonce },
+            SsChunks {
+                aead: daead,
+                nonce: dnonce,
+            },
+            link,
+            timer,
+            counter,
+            leftover,
+        )
+        .await
     }
 }
 
@@ -272,6 +235,31 @@ where
         w.write_all(&out).await?;
     }
     Ok(())
+}
+
+/// Per-direction Shadowsocks AEAD chunk codec state (subkey cipher + nonce
+/// counter), adapting the chunk codec to the shared [`relay_framed`] loop.
+struct SsChunks {
+    aead: Aead,
+    nonce: NonceCtr,
+}
+
+impl ChunkRead for SsChunks {
+    async fn read_chunk<R>(&mut self, r: &mut R) -> io::Result<Option<Bytes>>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        ss_read_chunk(r, &self.aead, &mut self.nonce).await
+    }
+}
+
+impl ChunkWrite for SsChunks {
+    async fn write_chunk<W>(&mut self, w: &mut W, data: &[u8]) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
+        ss_write_chunks(w, &self.aead, &mut self.nonce, data).await
+    }
 }
 
 // ---------------------------------------------------------------------------

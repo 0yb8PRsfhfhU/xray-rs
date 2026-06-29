@@ -28,6 +28,7 @@ use kernel::{Ctx, Destination, Dispatcher, Network, Policy, Timer, Uuid};
 use transport::Stream;
 
 use crate::ProxyInbound;
+use crate::io::{ChunkRead, ChunkWrite, relay_framed, user_counter};
 use crate::crypto::{Aead, AeadKind};
 
 const MAGIC: &[u8] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
@@ -456,6 +457,31 @@ where
     Ok(())
 }
 
+impl ChunkRead for Body {
+    async fn read_chunk<R>(&mut self, r: &mut R) -> io::Result<Option<Bytes>>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        read_chunk(r, self).await
+    }
+}
+
+impl ChunkWrite for Body {
+    async fn write_chunk<W>(&mut self, w: &mut W, data: &[u8]) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
+        write_chunk(w, self, data).await
+    }
+
+    async fn finish<W>(&mut self, w: &mut W) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
+        write_terminal(w, self).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -499,8 +525,7 @@ impl Vmess {
         let req = timeout(policy.handshake, self.read_header(&mut conn))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
-        let mut ctx = ctx.clone();
-        ctx.user_email = Some(req.email.clone());
+        let ctx = ctx.with_user(req.email.clone());
         let ctx = &ctx;
 
         // Response key/iv derived from request key/iv.
@@ -595,54 +620,9 @@ impl Vmess {
         }
 
         let timer = Timer::new(policy.idle);
-        let maybe_counter = if let Some(stats) = disp.stats()
-            && let Some(ref user_email) = ctx.user_email
-        {
-            Some(stats.counter(user_email).await)
-        } else {
-            None
-        };
+        let counter = user_counter(ctx, disp).await;
         let link = disp.dispatch_tcp(ctx, req.dest, timer.clone());
-        let kernel::Link { mut reader, writer } = link;
-        let (mut r, mut w) = tokio::io::split(conn);
-        let token = timer.token();
-
-        let up_counter = maybe_counter.clone();
-        let up_loop = async move {
-            loop {
-                match read_chunk(&mut r, &mut up).await? {
-                    Some(chunk) if chunk.is_empty() => continue,
-                    Some(chunk) => {
-                        timer.update();
-                        if let Some(c) = &up_counter {
-                            c.add_up(chunk.len() as u64);
-                        }
-                        if writer.send(chunk).await.is_err() {
-                            return io::Result::Ok(());
-                        }
-                    }
-                    None => return io::Result::Ok(()),
-                }
-            }
-        };
-        let down_counter = maybe_counter.clone();
-        let down_loop = async move {
-            while let Some(data) = reader.recv().await {
-                if let Some(c) = &down_counter {
-                    c.add_down(data.len() as u64);
-                }
-                write_chunk(&mut w, &mut down, &data).await?;
-            }
-            let _ = write_terminal(&mut w, &mut down).await;
-            let _ = w.flush().await;
-            io::Result::Ok(())
-        };
-
-        tokio::select! {
-            _ = token.cancelled() => Err(io::Error::new(io::ErrorKind::TimedOut, "idle")),
-            r = up_loop => r,
-            r = down_loop => r,
-        }
+        relay_framed(conn, up, down, link, timer, counter, Bytes::new()).await
     }
 
     async fn read_header<R>(&self, conn: &mut R) -> io::Result<Request>

@@ -114,8 +114,7 @@ impl ProxyInbound for Trojan {
             parse(b, &users)
         })
         .await?;
-        let mut ctx = ctx.clone();
-        ctx.user_email = Some(email);
+        let ctx = ctx.with_user(email);
         let ctx = &ctx;
         let timer = Timer::new(policy.idle);
         match dest.network {

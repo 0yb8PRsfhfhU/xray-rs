@@ -279,7 +279,7 @@ async fn controller_binds_inbound_and_reports_counted_traffic() {
 
     // Simulate proxied traffic: bump the user's counter as the data plane would.
     let user_tag = format!("{tag}||1"); // {node_tag}|{email=""}|{uid=1}
-    let counter = stats.counter(&user_tag);
+    let counter = stats.counter(&user_tag).await;
     counter.add_up(1000);
     counter.add_down(2000);
 
