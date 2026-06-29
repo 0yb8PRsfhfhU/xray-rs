@@ -2,17 +2,16 @@
 //! the shared data plane (dispatcher + freedom outbound + per-user stats), then
 //! start one [`Controller`] per SSPanel node and drive their polling loops.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use compact_str::CompactString;
-use kernel::{CachedResolver, Dispatcher, Outbound, Policy, Stats, SystemDialer};
+use kernel::{CachedResolver, Dispatcher, Policy, Stats, SystemDialer};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::controller::Controller;
+use crate::egress_compile;
 use crate::inbound_manager::InboundManager;
 use crate::sspanel::SspanelClient;
 
@@ -24,10 +23,11 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
 
     let resolver = Arc::new(CachedResolver::system().context("DNS resolver")?);
     let dialer = SystemDialer::new(resolver);
-    let mut outbounds: HashMap<CompactString, Outbound> = HashMap::new();
-    outbounds.insert(CompactString::new("freedom"), Outbound::Freedom);
-    let dispatcher =
-        Arc::new(Dispatcher::new(dialer, outbounds, "freedom", None).with_stats(stats.clone()));
+    let egress = egress_compile::compile(&config.egress).context("egress routing")?;
+    let dispatcher = Arc::new(
+        Dispatcher::new(dialer, egress.outbounds, egress.default_tag, egress.router)
+            .with_stats(stats.clone()),
+    );
 
     let policy = Policy {
         handshake: Duration::from_secs(u64::from(config.connection.handshake.max(1))),

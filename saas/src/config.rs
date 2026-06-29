@@ -13,6 +13,8 @@
 use anyhow::Context;
 use serde::Deserialize;
 
+use crate::egress_config::EgressConfig;
+
 /// Top-level config (`panel.Config`). Only `Nodes` is required; `Log` and
 /// `ConnectionConfig` fall back to XrayR's documented defaults when omitted.
 #[derive(Debug, Clone, Deserialize)]
@@ -23,6 +25,9 @@ pub struct Config {
     pub connection: ConnectionConfig,
     #[serde(rename = "Nodes")]
     pub nodes: Vec<NodeConfig>,
+    /// Optional top-level egress routing DSL: `enable = true` + `[[routes]]`.
+    #[serde(flatten)]
+    pub egress: EgressConfig,
 }
 
 /// Logging configuration (`panel.LogConfig`).

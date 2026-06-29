@@ -9,6 +9,8 @@ pub mod api;
 pub mod builder;
 pub mod config;
 pub mod controller;
+pub mod egress_compile;
+pub mod egress_config;
 pub mod inbound_manager;
 pub mod panel;
 pub mod serverstatus;
