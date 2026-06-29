@@ -126,8 +126,18 @@ impl Controller {
                 tracing::warn!("new node port is 0, ignoring");
                 return;
             }
-            let users = new_users.unwrap_or_else(|| self.user_list.clone());
             let old_tag = self.node_tag.clone();
+            let users = match new_users {
+                Some(users) => users,
+                None => {
+                    tracing::debug!(
+                        tag = %old_tag,
+                        count = self.user_list.len(),
+                        "node changed; reusing cached user list"
+                    );
+                    self.user_list.clone()
+                }
+            };
             self.ibm.remove(&old_tag);
             self.prune_all_stats(&old_tag);
 
@@ -147,11 +157,36 @@ impl Controller {
             self.node_tag = tag;
             self.node_info = Some(node);
             self.user_list = users;
-        } else if let Some(users) = new_users
-            && users_differ(&self.user_list, &users)
-            && let Some(node) = self.node_info.clone()
-            && let Some(handler) = self.ibm.handler(&self.node_tag)
-        {
+        } else {
+            let Some(users) = new_users else {
+                tracing::debug!(tag = %self.node_tag, "user list not modified");
+                return;
+            };
+            if !users_differ(&self.user_list, &users) {
+                tracing::debug!(
+                    tag = %self.node_tag,
+                    count = users.len(),
+                    "user list unchanged"
+                );
+                return;
+            }
+            let Some(node) = self.node_info.clone() else {
+                tracing::debug!(
+                    tag = %self.node_tag,
+                    count = users.len(),
+                    "user list fetched but node info is unavailable"
+                );
+                return;
+            };
+            let Some(handler) = self.ibm.handler(&self.node_tag) else {
+                tracing::debug!(
+                    tag = %self.node_tag,
+                    count = users.len(),
+                    "user list fetched but inbound handler is unavailable"
+                );
+                return;
+            };
+
             if let Err(e) = apply_users(&handler, &node, &users, &self.node_tag) {
                 tracing::error!(error = %e, "syncing users failed");
                 return;
