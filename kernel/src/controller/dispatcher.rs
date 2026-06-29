@@ -98,6 +98,7 @@ impl Dispatcher {
         let ob = self.select(ctx, &dest, sniffed);
         let dialer = self.dialer.clone();
         let id = ctx.id;
+        tracing::debug!(session = id, dest = %dest, "dispatch tcp");
         tokio::spawn(async move {
             if let Err(e) = ob.handle_tcp(&dialer, dest, outbound_half, &timer).await {
                 tracing::debug!(session = id, error = %e, "outbound tcp ended");
@@ -116,6 +117,7 @@ impl Dispatcher {
             .unwrap_or(Outbound::Freedom);
         let dialer = self.dialer.clone();
         let id = ctx.id;
+        tracing::debug!(session = id, inbound = %ctx.inbound_tag, "dispatch udp");
         tokio::spawn(async move {
             if let Err(e) = ob.handle_udp(&dialer, outbound_half, &timer).await {
                 tracing::debug!(session = id, error = %e, "outbound udp ended");

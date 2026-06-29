@@ -124,6 +124,11 @@ pub struct ControllerConfig {
     pub dns_type: String,
     #[serde(rename = "CertConfig", default)]
     pub cert: CertConfig,
+    /// Catch-all for XrayR keys this core does not model (fallback, custom DNS,
+    /// REALITY, custom inbound/outbound, routing, …). Captured only so they can
+    /// be warned about at startup; never read otherwise.
+    #[serde(flatten)]
+    pub unknown: std::collections::BTreeMap<String, toml::Value>,
 }
 
 /// TLS certificate acquisition settings (`mylego.CertConfig`).
@@ -206,6 +211,7 @@ impl Default for ControllerConfig {
             disable_get_rule: false,
             dns_type: default_dns_type(),
             cert: CertConfig::default(),
+            unknown: std::collections::BTreeMap::new(),
         }
     }
 }

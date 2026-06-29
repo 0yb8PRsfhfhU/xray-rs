@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use compact_str::CompactString;
@@ -75,6 +75,14 @@ impl Controller {
 
         let built = build_inbound(&node, &users, &self.cfg.listen_ip, &self.cfg.cert)?;
         let tag = built.tag.clone();
+        tracing::debug!(
+            tag = %tag,
+            port = node.port,
+            transport = %node.transport_protocol,
+            tls = node.enable_tls,
+            users = users.len(),
+            "initial node and user list fetched"
+        );
         self.ibm.add(built)?;
         self.node_tag = tag;
         self.node_info = Some(node);
@@ -91,8 +99,19 @@ impl Controller {
                 _ = shutdown.cancelled() => break,
                 _ = tokio::time::sleep(interval) => {}
             }
+            let started = Instant::now();
+            tracing::debug!(
+                tag = %self.node_tag,
+                interval_secs = interval.as_secs(),
+                "controller periodic tick started"
+            );
             self.node_info_monitor().await;
             self.user_info_monitor().await;
+            tracing::debug!(
+                tag = %self.node_tag,
+                elapsed_ms = started.elapsed().as_millis(),
+                "controller periodic tick finished"
+            );
         }
         self.ibm.remove(&self.node_tag);
         tracing::info!(tag = %self.node_tag, "controller stopped");
@@ -103,7 +122,10 @@ impl Controller {
     pub async fn node_info_monitor(&mut self) {
         let new_node = match self.api.get_node_info().await {
             Ok(n) => Some(n),
-            Err(ApiError::NotModified) => None,
+            Err(ApiError::NotModified) => {
+                tracing::debug!(tag = %self.node_tag, "node info not modified");
+                None
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "GetNodeInfo failed");
                 return;
@@ -127,6 +149,13 @@ impl Controller {
                 return;
             }
             let old_tag = self.node_tag.clone();
+            tracing::debug!(
+                old = %old_tag,
+                port = node.port,
+                transport = %node.transport_protocol,
+                tls = node.enable_tls,
+                "node info changed; rebuilding inbound"
+            );
             let users = match new_users {
                 Some(users) => users,
                 None => {
@@ -158,6 +187,9 @@ impl Controller {
             self.node_info = Some(node);
             self.user_list = users;
         } else {
+            if new_node.is_some() {
+                tracing::debug!(tag = %self.node_tag, "node info unchanged");
+            }
             let Some(users) = new_users else {
                 tracing::debug!(tag = %self.node_tag, "user list not modified");
                 return;
@@ -202,6 +234,28 @@ impl Controller {
     /// core has no device limiter or rule manager to source them).
     pub async fn user_info_monitor(&mut self) {
         let status = serverstatus::get_system_info().await;
+        tracing::debug!(
+            tag = %self.node_tag,
+            cpu = status.cpu,
+            mem = status.mem,
+            disk = status.disk,
+            uptime = status.uptime,
+            "node status sampled"
+        );
+
+        // Per-user speed/device limits arrive from the panel in UserInfo but this
+        // core cannot enforce them. Surfaced at debug (once per poll is harmless).
+        let speed = self.user_list.iter().filter(|u| u.speed_limit > 0).count();
+        let device = self.user_list.iter().filter(|u| u.device_limit > 0).count();
+        if speed > 0 || device > 0 {
+            tracing::debug!(
+                tag = %self.node_tag,
+                users_with_speed_limit = speed,
+                users_with_device_limit = device,
+                "panel reports per-user speed/device limits; this core does not enforce them"
+            );
+        }
+
         if let Err(e) = self.api.report_node_status(&status).await {
             tracing::warn!(error = %e, "ReportNodeStatus failed");
         }
@@ -226,11 +280,17 @@ impl Controller {
         }
 
         if traffic.is_empty() {
+            tracing::debug!(tag = %self.node_tag, "no user traffic to report");
             return;
         }
 
         if self.cfg.disable_upload_traffic {
             // Counted but discarded (XrayR resets without reporting in this mode).
+            tracing::debug!(
+                tag = %self.node_tag,
+                count = traffic.len(),
+                "user traffic upload disabled; counters discarded"
+            );
             return;
         }
 

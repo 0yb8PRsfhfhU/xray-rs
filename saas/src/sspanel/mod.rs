@@ -129,6 +129,18 @@ impl SspanelClient {
         let params = self.parse_params();
         // Old API when custom config is disabled or the panel predates 2021.11.
         let expired = compare_version(&node_resp.version, "2021.11") == -1;
+        tracing::debug!(
+            version = %node_resp.version,
+            expired,
+            disable_custom_config = self.disable_custom_config,
+            node_type = %self.node_type.as_str(),
+            parser = if self.disable_custom_config || expired {
+                "legacy"
+            } else {
+                "custom_config"
+            },
+            "node info response decoded"
+        );
         if self.disable_custom_config || expired {
             if expired {
                 tracing::warn!(
@@ -164,13 +176,16 @@ impl SspanelClient {
                 context: "user list",
                 source: e,
             })?;
-        parse_user_list_response(&self.parse_params(), &users)
+        let parsed = parse_user_list_response(&self.parse_params(), &users)?;
+        tracing::debug!(count = parsed.len(), "user list fetched");
+        Ok(parsed)
     }
 
     /// Report host status (`APIClient.ReportNodeStatus`). No-op on panels
     /// >= 2023.2, which compute load server-side.
     pub async fn report_node_status(&self, status: &NodeStatus) -> ApiResult<()> {
-        if compare_version(&self.get_version(), "2023.2") == -1 {
+        let version = self.get_version();
+        if compare_version(&version, "2023.2") == -1 {
             let path = format!("/mod_mu/nodes/{}/info", self.node_id);
             let body = SystemLoad {
                 uptime: status.uptime.to_string(),
@@ -182,6 +197,11 @@ impl SspanelClient {
                 ),
             };
             self.post_json(&path, false, &body).await?;
+        } else {
+            tracing::debug!(
+                version = %version,
+                "node status report skipped by panel version"
+            );
         }
         Ok(())
     }
@@ -286,6 +306,13 @@ impl SspanelClient {
         node_id_query: bool,
     ) -> ApiResult<Value> {
         let etag = self.get_etag(etag_key);
+        tracing::debug!(
+            path = path,
+            etag_key = etag_key,
+            node_id_query = node_id_query,
+            has_etag = !etag.is_empty(),
+            "panel GET request"
+        );
         let mut req = self
             .request(reqwest::Method::GET, path)
             .header(IF_NONE_MATCH, etag);
@@ -294,7 +321,14 @@ impl SspanelClient {
         }
 
         let resp = self.send_with_retry(req, path).await?;
-        if resp.status().as_u16() == 304 {
+        let status = resp.status().as_u16();
+        if status == 304 {
+            tracing::debug!(
+                path = path,
+                etag_key = etag_key,
+                status = status,
+                "panel GET not modified"
+            );
             return Err(ApiError::NotModified);
         }
         let etag_val = resp
@@ -303,7 +337,14 @@ impl SspanelClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        self.set_etag(etag_key, &etag_val);
+        if self.set_etag(etag_key, &etag_val) {
+            tracing::debug!(
+                path = path,
+                etag_key = etag_key,
+                etag_changed = true,
+                "panel GET ETag updated"
+            );
+        }
 
         self.parse_response(path, resp).await
     }
@@ -322,6 +363,11 @@ impl SspanelClient {
         let req = req.json(body);
         let resp = self.send_with_retry(req, path).await?;
         self.parse_response(path, resp).await?;
+        tracing::debug!(
+            path = path,
+            node_id_query = node_id_query,
+            "panel POST completed"
+        );
         Ok(())
     }
 
@@ -379,12 +425,20 @@ impl SspanelClient {
         // Up to two clone-and-retry passes, then a final consuming send that
         // surfaces the real error. If the body is not cloneable, fall straight
         // through to the single consuming send.
-        for _ in 0..2 {
-            let Some(attempt) = builder.try_clone() else {
+        for attempt in [1_u8, 2_u8] {
+            let Some(request) = builder.try_clone() else {
                 break;
             };
-            if let Ok(resp) = attempt.send().await {
-                return Ok(resp);
+            match request.send().await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    tracing::debug!(
+                        path = path,
+                        attempt = attempt,
+                        error = %e,
+                        "panel request transport retry failed"
+                    );
+                }
             }
         }
         builder.send().await.map_err(|e| ApiError::Request {
@@ -397,15 +451,16 @@ impl SspanelClient {
         self.etags.lock().get(key).cloned().unwrap_or_default()
     }
 
-    fn set_etag(&self, key: &'static str, value: &str) {
+    fn set_etag(&self, key: &'static str, value: &str) -> bool {
         if value.is_empty() {
-            return;
+            return false;
         }
         let mut m = self.etags.lock();
         let differs = m.get(key).map(|cur| cur != value).unwrap_or(true);
         if differs {
             m.insert(key, value.to_string());
         }
+        differs
     }
 
     fn get_version(&self) -> String {

@@ -95,9 +95,11 @@ impl InboundManager {
                     let utk = token.clone();
                     tracing::info!(tag = %utag, %addr, "listening (udp)");
                     tasks.push(tokio::spawn(async move {
-                        let ctx = Ctx::new(utag, None);
+                        let ctx = Ctx::new(utag.clone(), None);
                         tokio::select! {
-                            _ = utk.cancelled() => {}
+                            _ = utk.cancelled() => {
+                                tracing::debug!(tag = %utag, "udp listener stopped");
+                            }
                             r = uh.serve_udp(sock, &ctx, &ud, &policy) => {
                                 if let Err(e) = r {
                                     tracing::debug!(error = %e, "udp listener ended");
@@ -120,7 +122,10 @@ impl InboundManager {
         tasks.push(tokio::spawn(async move {
             loop {
                 let accepted = tokio::select! {
-                    _ = acc_token.cancelled() => break,
+                    _ = acc_token.cancelled() => {
+                        tracing::debug!(tag = %acc_tag, "accept loop stopped");
+                        break;
+                    }
                     res = listener.accept() => res,
                 };
                 let (tcp, peer) = match accepted {
