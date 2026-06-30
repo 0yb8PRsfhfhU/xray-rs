@@ -40,6 +40,10 @@ pub enum Error {
     /// A wrapped I/O error from the transport.
     #[error(transparent)]
     Io(#[from] io::Error),
+
+    /// Try to create a service that should not be created
+    #[error("service stack error: Try to create a service that should not be created")]
+    ServiceStack,
 }
 
 impl From<Error> for io::Error {

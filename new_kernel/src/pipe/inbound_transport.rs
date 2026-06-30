@@ -1,5 +1,6 @@
 use crate::rcu_helper::RcuCell;
 use std::marker::PhantomData;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
@@ -105,12 +106,14 @@ pub enum Accepted<T: AsyncRead + AsyncWrite + Unpin> {
 
 pub trait InboundTransport<T: AsyncRead + AsyncWrite + Unpin + Send> {
     type StreamTy: AsyncRead + AsyncWrite + Unpin;
+    fn listen_at(&self) -> SocketAddr;
     fn call(
         &self,
         conn: InboundConnection<T>,
     ) -> impl Future<Output = std::io::Result<Accepted<Self::StreamTy>>> + Send;
 }
 
+#[derive(Debug)]
 pub struct InboundList<T: InboundTransport<Str>, Str>(RcuCell<[T]>, PhantomData<fn(Str)>)
 where
     Str: AsyncRead + AsyncWrite + Unpin + Send;
@@ -137,13 +140,3 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct InboundContext<T, Str>
-where
-    T: InboundTransport<Str>,
-    Str: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    pub list: Arc<[T]>,
-    pub index: usize,
-    pub _phantom: PhantomData<InboundList<T, Str>>,
-}
