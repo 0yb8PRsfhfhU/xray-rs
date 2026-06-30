@@ -4,7 +4,7 @@ members = ["kernel", "proxy", "transport", "app", "saas", "new_kernel"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.7-alpha"
+version = "0.1.9-alpha"
 license = "unfree"
 
 [workspace.dependencies]
@@ -30,6 +30,7 @@ thiserror = "2"
 anyhow = "1.0.103"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
 rand = "0.10"
 
 # tls (OpenSSL per objective, not rustls)

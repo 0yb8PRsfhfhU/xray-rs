@@ -131,7 +131,16 @@ impl InboundManager {
                 let (tcp, peer) = match accepted {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::warn!(error = %e, "accept failed");
+                        // EMFILE (24) / ENFILE (23): fd exhaustion — back off to let
+                        // connections close rather than spinning and flooding logs.
+                        if matches!(e.raw_os_error(), Some(23) | Some(24)) {
+                            tracing::warn!(error = %e, "accept failed");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        } else if e.kind() != std::io::ErrorKind::ConnectionAborted {
+                            // ConnectionAborted is harmless (client dropped before accept);
+                            // log everything else.
+                            tracing::warn!(error = %e, "accept failed");
+                        }
                         continue;
                     }
                 };
