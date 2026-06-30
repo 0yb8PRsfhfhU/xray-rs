@@ -14,14 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes::Aes128;
 use aes::cipher::BlockCipherDecrypt;
-use aes_gcm::aead::{Aead as _, Payload};
-use aes_gcm::{Aes128Gcm, KeyInit as _GcmInit, Nonce};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use compact_str::CompactString;
-use md5::Md5;
 use sha2::{Digest, Sha256};
-use shake::digest::{ExtendableOutput, Update as _, XofReader};
-use shake::{Shake128, Shake128Reader};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -33,19 +28,11 @@ use transport::Stream;
 
 use crate::ProxyInbound;
 use crate::crypto::{Aead, AeadKind};
-use crate::io::{ChunkRead, ChunkWrite, relay_framed, user_counter};
+use crate::io::{relay_framed, user_counter};
 
-const MAGIC: &[u8] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
-const KDF_SALT: &[u8] = b"VMess AEAD KDF";
-const SALT_AUTHID: &[u8] = b"AES Auth ID Encryption";
-const SALT_HDR_LEN_KEY: &[u8] = b"VMess Header AEAD Key_Length";
-const SALT_HDR_LEN_IV: &[u8] = b"VMess Header AEAD Nonce_Length";
-const SALT_HDR_KEY: &[u8] = b"VMess Header AEAD Key";
-const SALT_HDR_IV: &[u8] = b"VMess Header AEAD Nonce";
-const SALT_RESP_LEN_KEY: &[u8] = b"AEAD Resp Header Len Key";
-const SALT_RESP_LEN_IV: &[u8] = b"AEAD Resp Header Len IV";
-const SALT_RESP_KEY: &[u8] = b"AEAD Resp Header Key";
-const SALT_RESP_IV: &[u8] = b"AEAD Resp Header IV";
+mod crypto;
+
+use crypto::*;
 
 const OPT_CHUNK_MASKING: u8 = 0x04;
 const OPT_GLOBAL_PADDING: u8 = 0x08;
@@ -75,149 +62,6 @@ fn vmess_auth_limiter() -> Arc<Semaphore> {
         .clone()
 }
 
-// ---------------------------------------------------------------------------
-// Primitives
-// ---------------------------------------------------------------------------
-
-fn md5_16(data: &[u8]) -> [u8; 16] {
-    let mut h = Md5::new();
-    md5::Digest::update(&mut h, data);
-    h.finalize().into()
-}
-
-fn fnv1a(data: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c_9dc5;
-    for b in data {
-        h ^= u32::from(*b);
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    h
-}
-
-/// cmdKey = MD5(uuid ‖ magic).
-fn cmd_key(uuid: &Uuid) -> [u8; 16] {
-    let mut buf = Vec::with_capacity(16usize.saturating_add(MAGIC.len()));
-    buf.extend_from_slice(uuid.as_bytes());
-    buf.extend_from_slice(MAGIC);
-    md5_16(&buf)
-}
-
-/// VMess body ChaCha20 key: md5(k) ‖ md5(md5(k)).
-fn chacha_key(k: &[u8]) -> [u8; 32] {
-    let a = md5_16(k);
-    let b = md5_16(&a);
-    let mut out = [0u8; 32];
-    if let Some(s) = out.get_mut(..16) {
-        s.copy_from_slice(&a);
-    }
-    if let Some(s) = out.get_mut(16..) {
-        s.copy_from_slice(&b);
-    }
-    out
-}
-
-// ---- nested-HMAC VMess KDF ----
-
-fn sha256(data: &[u8]) -> [u8; 32] {
-    Sha256::digest(data).into()
-}
-
-fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    let mut k = [0u8; 64];
-    if key.len() > 64 {
-        let h = sha256(key);
-        if let Some(s) = k.get_mut(..32) {
-            s.copy_from_slice(&h);
-        }
-    } else if let Some(s) = k.get_mut(..key.len()) {
-        s.copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for (p, kk) in ipad.iter_mut().zip(k.iter()) {
-        *p ^= *kk;
-    }
-    for (p, kk) in opad.iter_mut().zip(k.iter()) {
-        *p ^= *kk;
-    }
-    let mut inner = Vec::with_capacity(64usize.saturating_add(msg.len()));
-    inner.extend_from_slice(&ipad);
-    inner.extend_from_slice(msg);
-    let ih = sha256(&inner);
-    let mut outer = Vec::with_capacity(96);
-    outer.extend_from_slice(&opad);
-    outer.extend_from_slice(&ih);
-    sha256(&outer)
-}
-
-fn kdf_level(keys: &[&[u8]], level: usize, msg: &[u8]) -> [u8; 32] {
-    let key = match keys.get(level) {
-        Some(k) => *k,
-        None => return sha256(msg),
-    };
-    if level == 0 {
-        return hmac_sha256(key, msg);
-    }
-    let mut k = [0u8; 64];
-    if key.len() <= 64 {
-        if let Some(s) = k.get_mut(..key.len()) {
-            s.copy_from_slice(key);
-        }
-    } else {
-        let h = sha256(key);
-        if let Some(s) = k.get_mut(..32) {
-            s.copy_from_slice(&h);
-        }
-    }
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for (p, kk) in ipad.iter_mut().zip(k.iter()) {
-        *p ^= *kk;
-    }
-    for (p, kk) in opad.iter_mut().zip(k.iter()) {
-        *p ^= *kk;
-    }
-    let prev = level.saturating_sub(1);
-    let mut inner = Vec::with_capacity(64usize.saturating_add(msg.len()));
-    inner.extend_from_slice(&ipad);
-    inner.extend_from_slice(msg);
-    let ih = kdf_level(keys, prev, &inner);
-    let mut outer = Vec::with_capacity(96);
-    outer.extend_from_slice(&opad);
-    outer.extend_from_slice(&ih);
-    kdf_level(keys, prev, &outer)
-}
-
-/// VMess KDF: nested HMAC-SHA256 keyed by the salt then each path component.
-fn kdf(key: &[u8], paths: &[&[u8]]) -> [u8; 32] {
-    let mut keys: Vec<&[u8]> = Vec::with_capacity(paths.len().saturating_add(1));
-    keys.push(KDF_SALT);
-    keys.extend_from_slice(paths);
-    kdf_level(&keys, paths.len(), key)
-}
-
-fn kdf16(key: &[u8], paths: &[&[u8]]) -> [u8; 16] {
-    let full = kdf(key, paths);
-    let mut out = [0u8; 16];
-    if let Some(s) = full.get(..16) {
-        out.copy_from_slice(s);
-    }
-    out
-}
-
-fn aes128gcm_open(key: &[u8], nonce: &[u8], ct: &[u8], aad: &[u8]) -> io::Result<Vec<u8>> {
-    let cipher = Aes128Gcm::new_from_slice(key).map_err(|_| io::Error::other("gcm key"))?;
-    cipher
-        .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad })
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "vmess header open"))
-}
-
-fn aes128gcm_seal(key: &[u8], nonce: &[u8], pt: &[u8], aad: &[u8]) -> io::Result<Vec<u8>> {
-    let cipher = Aes128Gcm::new_from_slice(key).map_err(|_| io::Error::other("gcm key"))?;
-    cipher
-        .encrypt(Nonce::from_slice(nonce), Payload { msg: pt, aad })
-        .map_err(|_| io::Error::other("vmess header seal"))
-}
 
 // ---------------------------------------------------------------------------
 // Users
@@ -313,15 +157,12 @@ impl VmessUsers {
             .ok()
             .and_then(|d| i64::try_from(d.as_secs()).ok())
             .unwrap_or(0);
-        let mut tried = if preferred.is_some() || !active.is_empty() {
-            Some(vec![false; self.users.len()])
-        } else {
-            None
-        };
+        let mut tried =
+            TriedSet::new(preferred.is_some() || !active.is_empty(), self.users.len());
         if let Some(index) = preferred
             && let Some(user) = self.users.get(index)
         {
-            mark_tried(&mut tried, index);
+            tried.mark(index);
             if let Some(matched) =
                 Self::match_one(index, user, authid, now, VmessAuthKind::Preferred)
             {
@@ -330,20 +171,20 @@ impl VmessUsers {
         }
         for index in active {
             let index = *index;
-            if was_tried(&tried, index) {
+            if tried.contains(index) {
                 continue;
             }
             let Some(user) = self.users.get(index) else {
                 continue;
             };
-            mark_tried(&mut tried, index);
+            tried.mark(index);
             if let Some(matched) = Self::match_one(index, user, authid, now, VmessAuthKind::Active)
             {
                 return Some(matched);
             }
         }
         for (index, user) in self.users.iter().enumerate() {
-            if was_tried(&tried, index) {
+            if tried.contains(index) {
                 continue;
             }
             if let Some(matched) =
@@ -356,228 +197,35 @@ impl VmessUsers {
     }
 }
 
-fn mark_tried(tried: &mut Option<Vec<bool>>, index: usize) {
-    if let Some(tried) = tried
-        && let Some(slot) = tried.get_mut(index)
-    {
-        *slot = true;
+/// Tracks which user indices have already been trial-decrypted, so the
+/// preferred/active passes never re-test a user that the fallback scan repeats.
+/// `None` means "track nothing": the fallback-only path visits each index once.
+struct TriedSet(Option<Vec<bool>>);
+
+impl TriedSet {
+    fn new(track: bool, len: usize) -> TriedSet {
+        TriedSet(track.then(|| vec![false; len]))
     }
-}
 
-fn was_tried(tried: &Option<Vec<bool>>, index: usize) -> bool {
-    tried
-        .as_ref()
-        .and_then(|t| t.get(index))
-        .copied()
-        .unwrap_or(false)
-}
-
-// ---------------------------------------------------------------------------
-// Body chunk codec
-// ---------------------------------------------------------------------------
-
-struct ShakeParser {
-    reader: Shake128Reader,
-}
-
-impl ShakeParser {
-    fn new(iv: &[u8]) -> ShakeParser {
-        let mut shake = Shake128::default();
-        shake.update(iv);
-        ShakeParser {
-            reader: shake.finalize_xof(),
-        }
-    }
-    fn next_u16(&mut self) -> u16 {
-        let mut b = [0u8; 2];
-        self.reader.read(&mut b);
-        u16::from_be_bytes(b)
-    }
-}
-
-/// AEAD chunk body state for one direction.
-struct Body {
-    aead: Option<Aead>,
-    iv: [u8; 16],
-    count: u16,
-    shake: Option<ShakeParser>,
-    global_padding: bool,
-}
-
-impl Body {
-    fn overhead(&self) -> usize {
-        if self.aead.is_some() {
-            AeadKind::TAG
-        } else {
-            0
+    fn mark(&mut self, index: usize) {
+        if let Some(slots) = self.0.as_mut()
+            && let Some(slot) = slots.get_mut(index)
+        {
+            *slot = true;
         }
     }
 
-    fn chunk_nonce(&self) -> [u8; 12] {
-        let mut n = [0u8; 12];
-        let cb = self.count.to_be_bytes();
-        if let Some(dst) = n.get_mut(..2) {
-            dst.copy_from_slice(&cb);
-        }
-        if let (Some(dst), Some(src)) = (n.get_mut(2..12), self.iv.get(2..12)) {
-            dst.copy_from_slice(src);
-        }
-        n
-    }
-
-    /// Random padding length for the next frame. Global-padding mode draws it
-    /// from the SHAKE stream, so it is zero whenever masking (the stream) is off.
-    fn next_padding(&mut self) -> usize {
-        if self.global_padding {
-            self.shake
-                .as_mut()
-                .map_or(0, |s| usize::from(s.next_u16() % 64))
-        } else {
-            0
-        }
-    }
-
-    /// SHAKE length masking. XOR is symmetric, so this both masks (write) and
-    /// unmasks (read) a frame size; a no-op when masking is disabled.
-    fn mask_size(&mut self, size: u16) -> u16 {
-        match self.shake.as_mut() {
-            Some(s) => s.next_u16() ^ size,
-            None => size,
-        }
-    }
-
-    /// Seal one outbound body piece (or pass it through when security=none),
-    /// then advance the per-direction chunk counter.
-    fn seal_piece(&mut self, piece: &[u8]) -> io::Result<Vec<u8>> {
-        let ct = match &self.aead {
-            Some(aead) => {
-                let nonce = self.chunk_nonce();
-                aead.seal(&nonce, piece).map_err(io::Error::other)?
-            }
-            None => piece.to_vec(),
-        };
-        self.count = self.count.wrapping_add(1);
-        Ok(ct)
-    }
-
-    /// Open one inbound body piece (or pass it through when security=none),
-    /// then advance the per-direction chunk counter.
-    fn open_piece(&mut self, ct: &[u8]) -> io::Result<Vec<u8>> {
-        let plain = match &self.aead {
-            Some(aead) => {
-                let nonce = self.chunk_nonce();
-                aead.open(&nonce, ct)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-            }
-            None => ct.to_vec(),
-        };
-        self.count = self.count.wrapping_add(1);
-        Ok(plain)
-    }
-
-    /// Frame a sealed piece on the wire: masked length prefix, ciphertext, then
-    /// random padding. `padding` must come from a preceding `next_padding()` so
-    /// the SHAKE stream stays ordered as (padding, length) per frame.
-    fn encode_frame(&mut self, ct: &[u8], padding: usize) -> BytesMut {
-        let size = ct.len().saturating_add(padding);
-        let masked = self.mask_size(u16::try_from(size).unwrap_or(u16::MAX));
-        let mut out = BytesMut::with_capacity(size.saturating_add(2));
-        out.extend_from_slice(&masked.to_be_bytes());
-        out.extend_from_slice(ct);
-        if padding > 0 {
-            let mut pad = vec![0u8; padding];
-            rand::fill(&mut pad);
-            out.extend_from_slice(&pad);
-        }
-        out
+    fn contains(&self, index: usize) -> bool {
+        self.0
+            .as_ref()
+            .and_then(|s| s.get(index))
+            .copied()
+            .unwrap_or(false)
     }
 }
 
-async fn read_chunk<R>(r: &mut R, body: &mut Body) -> io::Result<Option<Bytes>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut size_buf = [0u8; 2];
-    match r.read_exact(&mut size_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    // SHAKE order per frame is (padding, length); keep these two calls in order.
-    let padding = body.next_padding();
-    let size = usize::from(body.mask_size(u16::from_be_bytes(size_buf)));
-    let floor = body.overhead().saturating_add(padding);
-    if size == floor {
-        return Ok(None); // terminal empty chunk
-    }
-    if size < floor {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "vmess chunk size",
-        ));
-    }
-    let mut chunk = vec![0u8; size];
-    r.read_exact(&mut chunk).await?;
-    let ct_len = size.saturating_sub(padding);
-    let ct = chunk.get(..ct_len).unwrap_or(&[]);
-    Ok(Some(Bytes::from(body.open_piece(ct)?)))
-}
-
-async fn write_chunk<W>(w: &mut W, body: &mut Body, data: &[u8]) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let max = 8192usize
-        .saturating_sub(body.overhead())
-        .saturating_sub(64)
-        .max(1);
-    for piece in data.chunks(max) {
-        // SHAKE order per frame is (padding, length): next_padding() then
-        // encode_frame()'s mask_size(). seal_piece() consumes no SHAKE bytes.
-        let padding = body.next_padding();
-        let ct = body.seal_piece(piece)?;
-        let frame = body.encode_frame(&ct, padding);
-        w.write_all(&frame).await?;
-    }
-    Ok(())
-}
-
-async fn write_terminal<W>(w: &mut W, body: &mut Body) -> io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    // The terminal marker is just an empty-payload frame (sealed to a bare tag
-    // under AEAD), framed identically to any other chunk.
-    let padding = body.next_padding();
-    let ct = body.seal_piece(&[])?;
-    let frame = body.encode_frame(&ct, padding);
-    w.write_all(&frame).await
-}
-
-impl ChunkRead for Body {
-    async fn read_chunk<R>(&mut self, r: &mut R) -> io::Result<Option<Bytes>>
-    where
-        R: AsyncRead + Unpin + Send,
-    {
-        read_chunk(r, self).await
-    }
-}
-
-impl ChunkWrite for Body {
-    async fn write_chunk<W>(&mut self, w: &mut W, data: &[u8]) -> io::Result<()>
-    where
-        W: AsyncWrite + Unpin + Send,
-    {
-        write_chunk(w, self, data).await
-    }
-
-    async fn finish<W>(&mut self, w: &mut W) -> io::Result<()>
-    where
-        W: AsyncWrite + Unpin + Send,
-    {
-        write_terminal(w, self).await
-    }
-}
+mod body;
+use body::*;
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -693,88 +341,13 @@ impl Vmess {
         let ctx = ctx.with_user(req.email.clone());
         let ctx = &ctx;
 
-        // Response key/iv derived from request key/iv.
-        let resp_key_full = Sha256::digest(req.req_key);
-        let resp_iv_full = Sha256::digest(req.req_iv);
-        let mut resp_key = [0u8; 16];
-        let mut resp_iv = [0u8; 16];
-        resp_key.copy_from_slice(resp_key_full.get(..16).unwrap_or(&[0u8; 16]));
-        resp_iv.copy_from_slice(resp_iv_full.get(..16).unwrap_or(&[0u8; 16]));
+        let (resp_key, resp_iv) = response_keys(&req);
+        write_response_header(&mut conn, &resp_key, &resp_iv, req.resp_header).await?;
+        let (up, down) = body_codecs(&req, &resp_key, &resp_iv)?;
 
-        // AEAD response header (38 bytes): [sealed len(18)][sealed payload(20)].
-        let resp_payload = [req.resp_header, 0u8, 0u8, 0u8];
-        let len_key = kdf16(&resp_key, &[SALT_RESP_LEN_KEY]);
-        let len_iv = kdf(&resp_iv, &[SALT_RESP_LEN_IV]);
-        let pay_key = kdf16(&resp_key, &[SALT_RESP_KEY]);
-        let pay_iv = kdf(&resp_iv, &[SALT_RESP_IV]);
-        let len_field = u16::try_from(resp_payload.len()).unwrap_or(0).to_be_bytes();
-        let sealed_len =
-            aes128gcm_seal(&len_key, len_iv.get(..12).unwrap_or(&[]), &len_field, &[])?;
-        let sealed_pay = aes128gcm_seal(
-            &pay_key,
-            pay_iv.get(..12).unwrap_or(&[]),
-            &resp_payload,
-            &[],
-        )?;
-        conn.write_all(&sealed_len).await?;
-        conn.write_all(&sealed_pay).await?;
-
-        // Body ciphers.
-        let masking = req.option & OPT_CHUNK_MASKING != 0;
-        let padding = req.option & OPT_GLOBAL_PADDING != 0;
-        let up_aead = body_aead(req.security, &req.req_key)?;
-        let down_aead = body_aead(req.security, &resp_key)?;
-        let mut up = Body {
-            aead: up_aead,
-            iv: req.req_iv,
-            count: 0,
-            shake: masking.then(|| ShakeParser::new(&req.req_iv)),
-            global_padding: padding,
-        };
-        let mut down = Body {
-            aead: down_aead,
-            iv: resp_iv,
-            count: 0,
-            shake: masking.then(|| ShakeParser::new(&resp_iv)),
-            global_padding: padding,
-        };
-
-        // Mux (XUDP / mux.cool): bridge the AEAD chunk body to a plaintext
-        // duplex and run the mux demuxer over it.
+        // Mux (XUDP / mux.cool) carries no address and is demuxed separately.
         if req.mux {
-            let (mine, theirs) = tokio::io::duplex(65536);
-            let (mut r, mut w) = tokio::io::split(conn);
-            let (mut mr, mut mw) = tokio::io::split(mine);
-            let bridge = tokio::spawn(async move {
-                let up_dir = async move {
-                    while let Ok(Some(c)) = read_chunk(&mut r, &mut up).await {
-                        if !c.is_empty() && mw.write_all(&c).await.is_err() {
-                            break;
-                        }
-                    }
-                };
-                let down_dir = async move {
-                    let mut buf = vec![0u8; 16384];
-                    loop {
-                        match mr.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                if write_chunk(&mut w, &mut down, buf.get(..n).unwrap_or(&[]))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    let _ = write_terminal(&mut w, &mut down).await;
-                };
-                tokio::join!(up_dir, down_dir);
-            });
-            let res = crate::mux::serve(theirs, bytes::Bytes::new(), ctx, disp, policy).await;
-            bridge.abort();
-            return res;
+            return serve_mux(conn, up, down, ctx, disp, policy).await;
         }
 
         if req.dest.network == Network::Udp {
@@ -879,6 +452,100 @@ impl ProxyInbound for Vmess {
     }
 }
 
+/// Derive the response key/iv from the request key/iv: SHA-256, truncated to 16.
+fn response_keys(req: &Request) -> ([u8; 16], [u8; 16]) {
+    let resp_key_full = Sha256::digest(req.req_key);
+    let resp_iv_full = Sha256::digest(req.req_iv);
+    let mut resp_key = [0u8; 16];
+    let mut resp_iv = [0u8; 16];
+    resp_key.copy_from_slice(resp_key_full.get(..16).unwrap_or(&[0u8; 16]));
+    resp_iv.copy_from_slice(resp_iv_full.get(..16).unwrap_or(&[0u8; 16]));
+    (resp_key, resp_iv)
+}
+
+/// Seal and write the 38-byte AEAD response header: [sealed len(18)][sealed payload(20)].
+async fn write_response_header<W>(
+    conn: &mut W,
+    resp_key: &[u8; 16],
+    resp_iv: &[u8; 16],
+    resp_header: u8,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let resp_payload = [resp_header, 0u8, 0u8, 0u8];
+    let len_key = kdf16(resp_key, &[SALT_RESP_LEN_KEY]);
+    let len_iv = kdf(resp_iv, &[SALT_RESP_LEN_IV]);
+    let pay_key = kdf16(resp_key, &[SALT_RESP_KEY]);
+    let pay_iv = kdf(resp_iv, &[SALT_RESP_IV]);
+    let len_field = u16::try_from(resp_payload.len()).unwrap_or(0).to_be_bytes();
+    let sealed_len = aes128gcm_seal(&len_key, len_iv.get(..12).unwrap_or(&[]), &len_field, &[])?;
+    let sealed_pay = aes128gcm_seal(
+        &pay_key,
+        pay_iv.get(..12).unwrap_or(&[]),
+        &resp_payload,
+        &[],
+    )?;
+    conn.write_all(&sealed_len).await?;
+    conn.write_all(&sealed_pay).await?;
+    Ok(())
+}
+
+/// Build the up (client->server) and down (server->client) chunk codecs for the
+/// negotiated security and chunk options.
+fn body_codecs(req: &Request, resp_key: &[u8; 16], resp_iv: &[u8; 16]) -> io::Result<(Body, Body)> {
+    let masking = req.option & OPT_CHUNK_MASKING != 0;
+    let padding = req.option & OPT_GLOBAL_PADDING != 0;
+    let up = Body::new(body_aead(req.security, &req.req_key)?, req.req_iv, masking, padding);
+    let down = Body::new(body_aead(req.security, resp_key)?, *resp_iv, masking, padding);
+    Ok((up, down))
+}
+
+/// Bridge the AEAD chunk body to a plaintext duplex and run the mux demuxer
+/// (XUDP / mux.cool) over it, aborting the bridge when the session ends.
+async fn serve_mux(
+    conn: Stream,
+    mut up: Body,
+    mut down: Body,
+    ctx: &Ctx,
+    disp: &Dispatcher,
+    policy: &Policy,
+) -> io::Result<()> {
+    let (mine, theirs) = tokio::io::duplex(65536);
+    let (mut r, mut w) = tokio::io::split(conn);
+    let (mut mr, mut mw) = tokio::io::split(mine);
+    let bridge = tokio::spawn(async move {
+        let up_dir = async move {
+            while let Ok(Some(c)) = read_chunk(&mut r, &mut up).await {
+                if !c.is_empty() && mw.write_all(&c).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let down_dir = async move {
+            let mut buf = vec![0u8; 16384];
+            loop {
+                match mr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if write_chunk(&mut w, &mut down, buf.get(..n).unwrap_or(&[]))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = write_terminal(&mut w, &mut down).await;
+        };
+        tokio::join!(up_dir, down_dir);
+    });
+    let res = crate::mux::serve(theirs, bytes::Bytes::new(), ctx, disp, policy).await;
+    bridge.abort();
+    res
+}
+
 fn body_aead(security: u8, key: &[u8; 16]) -> io::Result<Option<Aead>> {
     let mk = |kind, k: &[u8]| Aead::new(kind, k).map_err(io::Error::other);
     match security {
@@ -927,7 +594,9 @@ fn parse_header(header: &[u8]) -> Result<Request, Error> {
     let resp_header = *fixed.get(33).ok_or(Error::Protocol("resp"))?;
     let option = *fixed.get(34).ok_or(Error::Protocol("opt"))?;
     let padsec = *fixed.get(35).ok_or(Error::Protocol("padsec"))?;
-    let padding_len = usize::from(padsec >> 4);
+    // padsec high nibble is the address-padding length; the decrypted header
+    // already includes those bytes and the FNV1a check covers them, so the
+    // address codec reads what it needs and the trailing padding is just left.
     let security = padsec & 0x0f;
     let cmd = *fixed.get(37).ok_or(Error::Protocol("cmd"))?;
 
@@ -951,7 +620,6 @@ fn parse_header(header: &[u8]) -> Result<Request, Error> {
         _ => return Err(Error::Protocol("vmess command")),
     };
     let (address, port) = AddrCodec::VMESS.read(&mut b)?;
-    let _ = padding_len;
 
     Ok(Request {
         dest: Destination {
@@ -1174,60 +842,5 @@ mod tests {
         }
     }
 
-    fn codec_body(aead: bool, masking: bool, padding: bool, key: &[u8; 16], iv: &[u8; 16]) -> Body {
-        Body {
-            aead: aead.then(|| Aead::new(AeadKind::Aes128Gcm, key).expect("aead")),
-            iv: *iv,
-            count: 0,
-            shake: masking.then(|| ShakeParser::new(iv)),
-            global_padding: padding,
-        }
-    }
 
-    async fn codec_roundtrip(aead: bool, masking: bool, padding: bool, payloads: &[Vec<u8>]) {
-        let key = [7u8; 16];
-        let iv = [9u8; 16];
-        let mut writer = codec_body(aead, masking, padding, &key, &iv);
-        let mut reader = codec_body(aead, masking, padding, &key, &iv);
-
-        let mut wire: Vec<u8> = Vec::new();
-        for p in payloads {
-            write_chunk(&mut wire, &mut writer, p).await.expect("write");
-        }
-        write_terminal(&mut wire, &mut writer)
-            .await
-            .expect("terminal");
-
-        let mut src: &[u8] = &wire;
-        let mut out = Vec::new();
-        while let Some(chunk) = read_chunk(&mut src, &mut reader).await.expect("read") {
-            out.extend_from_slice(&chunk);
-        }
-        let expected: Vec<u8> = payloads.iter().flatten().copied().collect();
-        assert_eq!(
-            out, expected,
-            "roundtrip mismatch aead={aead} masking={masking} padding={padding}"
-        );
-        // NOTE: read_chunk reports the terminal chunk by returning None as soon as
-        // it decodes the length prefix; it deliberately does not drain the terminal
-        // frame's body (tag + padding). The stream ends there, so leftover bytes are
-        // expected. The contract under test is plaintext round-trip fidelity.
-    }
-
-    #[tokio::test]
-    async fn vmess_body_codec_roundtrip_matrix() {
-        // Includes a >8 KiB payload to exercise the multi-piece write loop.
-        let payloads = vec![
-            b"hello vmess".to_vec(),
-            vec![0xABu8; 20_000],
-            b"trailing chunk".to_vec(),
-        ];
-        for &aead in &[false, true] {
-            for &masking in &[false, true] {
-                for &padding in &[false, true] {
-                    codec_roundtrip(aead, masking, padding, &payloads).await;
-                }
-            }
-        }
-    }
 }
