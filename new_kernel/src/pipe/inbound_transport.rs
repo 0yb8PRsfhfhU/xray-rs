@@ -1,8 +1,8 @@
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
-use parking_lot::{RwLock, RwLockReadGuard};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 
 pub struct InboundConnection<T: AsyncRead + AsyncWrite + Unpin>(T);
@@ -113,13 +113,12 @@ pub trait InboundTransport<T: AsyncRead + AsyncWrite + Unpin + Send> {
 
 pub struct InboundList<T: InboundTransport<Str>, Str>(RwLock<Arc<[T]>>, PhantomData<fn(Str)>)
 where
-    Str: AsyncRead + AsyncWrite + Unpin + Send
-;
+    Str: AsyncRead + AsyncWrite + Unpin + Send;
 
 impl<T, Str> InboundList<T, Str>
 where
     T: InboundTransport<Str>,
-    Str: AsyncRead + AsyncWrite + Unpin + Send
+    Str: AsyncRead + AsyncWrite + Unpin + Send,
 {
     pub fn new(inner: impl IntoIterator<Item = T>) -> Self {
         Self(RwLock::new(inner.into_iter().collect()), PhantomData)
@@ -133,4 +132,15 @@ where
     pub fn update(&self, new: impl IntoIterator<Item = T>) {
         *self.0.write() = new.into_iter().collect();
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct InboundContext<T, Str>
+where
+    T: InboundTransport<Str>,
+    Str: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    pub list: Arc<[T]>,
+    pub index: usize,
+    pub _phantom: PhantomData<InboundList<T, Str>>,
 }

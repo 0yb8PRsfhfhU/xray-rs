@@ -68,3 +68,9 @@ pub struct ByteCounter {
     pub up: AtomicU64,
     pub down: AtomicU64,
 }
+
+#[derive(Debug, Clone)]
+pub struct UserContext<P> {
+    pub list: Arc<UserListInner<P>>,
+    pub index: usize,
+}
