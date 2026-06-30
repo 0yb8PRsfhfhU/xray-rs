@@ -1,5 +1,5 @@
 .idea
 target/
-config.toml
-route.toml
+/config.toml
+/route.toml
 tmp

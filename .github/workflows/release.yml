@@ -81,9 +81,9 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2204
     env:
       TARGET: x86_64-unknown-linux-musl
-      # Point the C compiler and linker at musl-gcc for the vendored OpenSSL build.
+      # CC is needed so vendored OpenSSL compiles against musl.
+      # The linker and -static rustflag are in .cargo/config.toml.
       CC: musl-gcc
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     steps:
       - name: Checkout
         uses: actions/checkout@v4
