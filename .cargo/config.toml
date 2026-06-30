@@ -1,8 +1,3 @@
-[target.x86_64-unknown-linux-musl]
-# musl-gcc defaults to PIE, which embeds /lib/ld-musl-x86_64.so.1 as the
-# ELF interpreter even when all dependencies are static .a files.  That
-# interpreter doesn't exist on glibc-only systems, causing the kernel to
-# report "No such file or directory" when the binary is executed.
-# -static forces a fully-static non-PIE binary with no interpreter entry.
-linker = "musl-gcc"
-rustflags = ["-C", "link-arg=-static"]
+# musl static builds are handled by cargo-zigbuild in CI, which uses Zig as
+# the C cross-compiler and produces correct fully-static binaries without the
+# PIE / CRT-mismatch issues of musl-gcc.

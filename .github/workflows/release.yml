@@ -81,22 +81,23 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2204
     env:
       TARGET: x86_64-unknown-linux-musl
-      # CC is needed so vendored OpenSSL compiles against musl.
-      # The linker and -static rustflag are in .cargo/config.toml.
-      CC: musl-gcc
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: false
 
-      - name: Install musl toolchain
-        run: sudo apt-get install -y musl-tools
-
       - name: Set up Rust (honors rust-toolchain.toml)
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup target add "$TARGET"
+
+      - name: Install cargo-zigbuild
+        # cargo-zigbuild uses Zig as the C cross-compiler, which produces correct
+        # fully-static musl binaries without the PIE/CRT-mismatch of musl-gcc.
+        run: |
+          pip install ziglang --quiet
+          cargo install cargo-zigbuild --locked
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
@@ -104,10 +105,10 @@ jobs:
           key: ${{ env.TARGET }}
 
       - name: Build simple binary (xray-rs)
-        run: cargo build --release --locked --target "$TARGET" -p app --features vendored
+        run: cargo zigbuild --release --locked --target "$TARGET" -p app --features vendored
 
       - name: Build SaaS binary (xray-saas)
-        run: cargo build --release --locked --target "$TARGET" -p saas --features vendored
+        run: cargo zigbuild --release --locked --target "$TARGET" -p saas --features vendored
 
       - name: Collect, strip, and checksum binaries
         run: |
