@@ -109,7 +109,10 @@ pub async fn user_counter(ctx: &Ctx, disp: &Dispatcher) -> Option<Arc<Counter>> 
 /// Uplink decoder for a framed (per-chunk) inbound body: decrypt/deframe one
 /// chunk off `r`, returning `Ok(None)` at clean end-of-stream.
 pub trait ChunkRead {
-    fn read_chunk<R>(&mut self, r: &mut R) -> impl Future<Output = io::Result<Option<Bytes>>> + Send
+    fn read_chunk<R>(
+        &mut self,
+        r: &mut R,
+    ) -> impl Future<Output = io::Result<Option<Bytes>>> + Send
     where
         R: AsyncRead + Unpin + Send;
 }
@@ -117,7 +120,11 @@ pub trait ChunkRead {
 /// Downlink encoder for a framed inbound body: frame/encrypt `data` onto `w`,
 /// then `finish` writes any terminal marker before the final flush.
 pub trait ChunkWrite {
-    fn write_chunk<W>(&mut self, w: &mut W, data: &[u8]) -> impl Future<Output = io::Result<()>> + Send
+    fn write_chunk<W>(
+        &mut self,
+        w: &mut W,
+        data: &[u8],
+    ) -> impl Future<Output = io::Result<()>> + Send
     where
         W: AsyncWrite + Unpin + Send;
 

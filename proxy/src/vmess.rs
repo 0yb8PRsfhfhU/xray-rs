@@ -424,6 +424,73 @@ impl Body {
         }
         n
     }
+
+    /// Random padding length for the next frame. Global-padding mode draws it
+    /// from the SHAKE stream, so it is zero whenever masking (the stream) is off.
+    fn next_padding(&mut self) -> usize {
+        if self.global_padding {
+            self.shake
+                .as_mut()
+                .map_or(0, |s| usize::from(s.next_u16() % 64))
+        } else {
+            0
+        }
+    }
+
+    /// SHAKE length masking. XOR is symmetric, so this both masks (write) and
+    /// unmasks (read) a frame size; a no-op when masking is disabled.
+    fn mask_size(&mut self, size: u16) -> u16 {
+        match self.shake.as_mut() {
+            Some(s) => s.next_u16() ^ size,
+            None => size,
+        }
+    }
+
+    /// Seal one outbound body piece (or pass it through when security=none),
+    /// then advance the per-direction chunk counter.
+    fn seal_piece(&mut self, piece: &[u8]) -> io::Result<Vec<u8>> {
+        let ct = match &self.aead {
+            Some(aead) => {
+                let nonce = self.chunk_nonce();
+                aead.seal(&nonce, piece).map_err(io::Error::other)?
+            }
+            None => piece.to_vec(),
+        };
+        self.count = self.count.wrapping_add(1);
+        Ok(ct)
+    }
+
+    /// Open one inbound body piece (or pass it through when security=none),
+    /// then advance the per-direction chunk counter.
+    fn open_piece(&mut self, ct: &[u8]) -> io::Result<Vec<u8>> {
+        let plain = match &self.aead {
+            Some(aead) => {
+                let nonce = self.chunk_nonce();
+                aead.open(&nonce, ct)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            }
+            None => ct.to_vec(),
+        };
+        self.count = self.count.wrapping_add(1);
+        Ok(plain)
+    }
+
+    /// Frame a sealed piece on the wire: masked length prefix, ciphertext, then
+    /// random padding. `padding` must come from a preceding `next_padding()` so
+    /// the SHAKE stream stays ordered as (padding, length) per frame.
+    fn encode_frame(&mut self, ct: &[u8], padding: usize) -> BytesMut {
+        let size = ct.len().saturating_add(padding);
+        let masked = self.mask_size(u16::try_from(size).unwrap_or(u16::MAX));
+        let mut out = BytesMut::with_capacity(size.saturating_add(2));
+        out.extend_from_slice(&masked.to_be_bytes());
+        out.extend_from_slice(ct);
+        if padding > 0 {
+            let mut pad = vec![0u8; padding];
+            rand::fill(&mut pad);
+            out.extend_from_slice(&pad);
+        }
+        out
+    }
 }
 
 async fn read_chunk<R>(r: &mut R, body: &mut Body) -> io::Result<Option<Bytes>>
@@ -436,23 +503,14 @@ where
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    let padding = if body.global_padding {
-        body.shake
-            .as_mut()
-            .map_or(0, |s| usize::from(s.next_u16() % 64))
-    } else {
-        0
-    };
-    let raw = u16::from_be_bytes(size_buf);
-    let size = match body.shake.as_mut() {
-        Some(s) => (s.next_u16() ^ raw) as usize,
-        None => raw as usize,
-    };
-    let overhead = body.overhead();
-    if size == overhead.saturating_add(padding) {
+    // SHAKE order per frame is (padding, length); keep these two calls in order.
+    let padding = body.next_padding();
+    let size = usize::from(body.mask_size(u16::from_be_bytes(size_buf)));
+    let floor = body.overhead().saturating_add(padding);
+    if size == floor {
         return Ok(None); // terminal empty chunk
     }
-    if size < overhead.saturating_add(padding) {
+    if size < floor {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "vmess chunk size",
@@ -462,55 +520,24 @@ where
     r.read_exact(&mut chunk).await?;
     let ct_len = size.saturating_sub(padding);
     let ct = chunk.get(..ct_len).unwrap_or(&[]);
-    let plain = match &body.aead {
-        Some(aead) => {
-            let nonce = body.chunk_nonce();
-            aead.open(&nonce, ct)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-        }
-        None => ct.to_vec(),
-    };
-    body.count = body.count.wrapping_add(1);
-    Ok(Some(Bytes::from(plain)))
+    Ok(Some(Bytes::from(body.open_piece(ct)?)))
 }
 
 async fn write_chunk<W>(w: &mut W, body: &mut Body, data: &[u8]) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let overhead = body.overhead();
-    let max = 8192usize.saturating_sub(overhead).saturating_sub(64);
-    for piece in data.chunks(max.max(1)) {
-        let padding = if body.global_padding {
-            body.shake
-                .as_mut()
-                .map_or(0, |s| usize::from(s.next_u16() % 64))
-        } else {
-            0
-        };
-        let ct = match &body.aead {
-            Some(aead) => {
-                let nonce = body.chunk_nonce();
-                aead.seal(&nonce, piece).map_err(io::Error::other)?
-            }
-            None => piece.to_vec(),
-        };
-        body.count = body.count.wrapping_add(1);
-        let size = ct.len().saturating_add(padding);
-        let size16 = u16::try_from(size).unwrap_or(u16::MAX);
-        let enc = match body.shake.as_mut() {
-            Some(s) => s.next_u16() ^ size16,
-            None => size16,
-        };
-        let mut out = BytesMut::with_capacity(size.saturating_add(2));
-        out.extend_from_slice(&enc.to_be_bytes());
-        out.extend_from_slice(&ct);
-        if padding > 0 {
-            let mut pad = vec![0u8; padding];
-            rand::fill(&mut pad);
-            out.extend_from_slice(&pad);
-        }
-        w.write_all(&out).await?;
+    let max = 8192usize
+        .saturating_sub(body.overhead())
+        .saturating_sub(64)
+        .max(1);
+    for piece in data.chunks(max) {
+        // SHAKE order per frame is (padding, length): next_padding() then
+        // encode_frame()'s mask_size(). seal_piece() consumes no SHAKE bytes.
+        let padding = body.next_padding();
+        let ct = body.seal_piece(piece)?;
+        let frame = body.encode_frame(&ct, padding);
+        w.write_all(&frame).await?;
     }
     Ok(())
 }
@@ -519,39 +546,12 @@ async fn write_terminal<W>(w: &mut W, body: &mut Body) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let overhead = body.overhead();
-    let padding = if body.global_padding {
-        body.shake
-            .as_mut()
-            .map_or(0, |s| usize::from(s.next_u16() % 64))
-    } else {
-        0
-    };
-    let ct = match &body.aead {
-        Some(aead) => {
-            let nonce = body.chunk_nonce();
-            aead.seal(&nonce, &[]).map_err(io::Error::other)?
-        }
-        None => Vec::new(),
-    };
-    body.count = body.count.wrapping_add(1);
-    let _ = overhead;
-    let size = ct.len().saturating_add(padding);
-    let size16 = u16::try_from(size).unwrap_or(u16::MAX);
-    let enc = match body.shake.as_mut() {
-        Some(s) => s.next_u16() ^ size16,
-        None => size16,
-    };
-    let mut out = BytesMut::new();
-    out.extend_from_slice(&enc.to_be_bytes());
-    out.extend_from_slice(&ct);
-    if padding > 0 {
-        let mut pad = vec![0u8; padding];
-        rand::fill(&mut pad);
-        out.extend_from_slice(&pad);
-    }
-    w.write_all(&out).await?;
-    Ok(())
+    // The terminal marker is just an empty-payload frame (sealed to a bare tag
+    // under AEAD), framed identically to any other chunk.
+    let padding = body.next_padding();
+    let ct = body.seal_piece(&[])?;
+    let frame = body.encode_frame(&ct, padding);
+    w.write_all(&frame).await
 }
 
 impl ChunkRead for Body {
@@ -1171,6 +1171,63 @@ mod tests {
             eprintln!(
                 "vmess auth users={size} fallback={fallback_elapsed:?} preferred={preferred_elapsed:?} active={active_elapsed:?}"
             );
+        }
+    }
+
+    fn codec_body(aead: bool, masking: bool, padding: bool, key: &[u8; 16], iv: &[u8; 16]) -> Body {
+        Body {
+            aead: aead.then(|| Aead::new(AeadKind::Aes128Gcm, key).expect("aead")),
+            iv: *iv,
+            count: 0,
+            shake: masking.then(|| ShakeParser::new(iv)),
+            global_padding: padding,
+        }
+    }
+
+    async fn codec_roundtrip(aead: bool, masking: bool, padding: bool, payloads: &[Vec<u8>]) {
+        let key = [7u8; 16];
+        let iv = [9u8; 16];
+        let mut writer = codec_body(aead, masking, padding, &key, &iv);
+        let mut reader = codec_body(aead, masking, padding, &key, &iv);
+
+        let mut wire: Vec<u8> = Vec::new();
+        for p in payloads {
+            write_chunk(&mut wire, &mut writer, p).await.expect("write");
+        }
+        write_terminal(&mut wire, &mut writer)
+            .await
+            .expect("terminal");
+
+        let mut src: &[u8] = &wire;
+        let mut out = Vec::new();
+        while let Some(chunk) = read_chunk(&mut src, &mut reader).await.expect("read") {
+            out.extend_from_slice(&chunk);
+        }
+        let expected: Vec<u8> = payloads.iter().flatten().copied().collect();
+        assert_eq!(
+            out, expected,
+            "roundtrip mismatch aead={aead} masking={masking} padding={padding}"
+        );
+        // NOTE: read_chunk reports the terminal chunk by returning None as soon as
+        // it decodes the length prefix; it deliberately does not drain the terminal
+        // frame's body (tag + padding). The stream ends there, so leftover bytes are
+        // expected. The contract under test is plaintext round-trip fidelity.
+    }
+
+    #[tokio::test]
+    async fn vmess_body_codec_roundtrip_matrix() {
+        // Includes a >8 KiB payload to exercise the multi-piece write loop.
+        let payloads = vec![
+            b"hello vmess".to_vec(),
+            vec![0xABu8; 20_000],
+            b"trailing chunk".to_vec(),
+        ];
+        for &aead in &[false, true] {
+            for &masking in &[false, true] {
+                for &padding in &[false, true] {
+                    codec_roundtrip(aead, masking, padding, &payloads).await;
+                }
+            }
         }
     }
 }
