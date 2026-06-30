@@ -1,5 +1,6 @@
-use arc_swap::ArcSwap;
 use compact_str::CompactString;
+use parking_lot::lock_api::RwLockReadGuard;
+use parking_lot::{RawRwLock, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -26,10 +27,10 @@ pub struct UserListInner<P> {
 }
 
 #[derive(Debug)]
-pub struct UserList<P>(pub ArcSwap<UserListInner<P>>);
+pub struct UserList<P>(RwLock<Arc<UserListInner<P>>>);
 
 impl<P> UserList<P> {
-    pub fn new(user_array: impl IntoIterator<Item = User<P>>) -> Self {
+    fn build_inner(user_array: impl IntoIterator<Item = User<P>>) -> Arc<UserListInner<P>> {
         let user_array: Vec<_> = user_array
             .into_iter()
             .map(|user| (user, ByteCounter::default()))
@@ -41,11 +42,24 @@ impl<P> UserList<P> {
             .map(|(i, (user, _))| (user.authorization.clone(), i))
             .collect();
 
-        let inner = UserListInner {
+        Arc::new(UserListInner {
             user_array,
             authorization_index,
-        };
-        Self(ArcSwap::new(Arc::new(inner)))
+        })
+    }
+    pub fn new(user_array: impl IntoIterator<Item = User<P>>) -> Self {
+        Self(RwLock::new(Self::build_inner(user_array)))
+    }
+    pub fn new_with_arc(inner: Arc<UserListInner<P>>) -> Self {
+        Self(RwLock::new(inner))
+    }
+    pub fn read(&self) -> RwLockReadGuard<'_, RawRwLock, Arc<UserListInner<P>>> {
+        self.0.read()
+    }
+    pub fn update(&self, new: impl IntoIterator<Item = User<P>>) {
+        let new_inner = Self::build_inner(new);
+        let mut guard = self.0.write();
+        *guard = new_inner;
     }
 }
 
