@@ -1,6 +1,7 @@
 pub mod dialer;
 pub mod dns;
 pub mod user;
+pub mod service_stack;
 
 use crate::Error;
 use compact_str::CompactString;
