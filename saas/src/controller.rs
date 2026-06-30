@@ -245,15 +245,17 @@ impl Controller {
 
         // Per-user speed/device limits arrive from the panel in UserInfo but this
         // core cannot enforce them. Surfaced at debug (once per poll is harmless).
-        let speed = self.user_list.iter().filter(|u| u.speed_limit > 0).count();
-        let device = self.user_list.iter().filter(|u| u.device_limit > 0).count();
-        if speed > 0 || device > 0 {
-            tracing::debug!(
-                tag = %self.node_tag,
-                users_with_speed_limit = speed,
-                users_with_device_limit = device,
-                "panel reports per-user speed/device limits; this core does not enforce them"
-            );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let speed = self.user_list.iter().filter(|u| u.speed_limit > 0).count();
+            let device = self.user_list.iter().filter(|u| u.device_limit > 0).count();
+            if speed > 0 || device > 0 {
+                tracing::debug!(
+                    tag = %self.node_tag,
+                    users_with_speed_limit = speed,
+                    users_with_device_limit = device,
+                    "panel reports per-user speed/device limits; this core does not enforce them"
+                );
+            }
         }
 
         if let Err(e) = self.api.report_node_status(&status).await {
@@ -263,20 +265,23 @@ impl Controller {
         let mut traffic: Vec<UserTraffic> = Vec::new();
         // Keep the taken counts so we can restore on report failure.
         let mut taken: Vec<(Arc<kernel::Counter>, u64, u64)> = Vec::new();
-        for u in &self.user_list {
-            let tag = build_user_tag(&self.node_tag, u);
-            if let Some(counter) = self.stats.get(&tag).await {
-                let (up, down) = counter.take();
-                if up > 0 || down > 0 {
-                    traffic.push(UserTraffic {
-                        uid: u.uid,
-                        email: u.email.clone(),
-                        upload: up as i64,
-                        download: down as i64,
-                    });
-                    taken.push((counter, up, down));
-                }
+        for (tag, counter) in self.stats.active_counters().await {
+            let (up, down) = counter.take();
+            if up == 0 && down == 0 {
+                continue;
             }
+            let Some((uid, email)) = parse_user_tag(&self.node_tag, &tag) else {
+                counter.restore(up, down);
+                tracing::debug!(tag = %tag, "active traffic counter does not match node tag");
+                continue;
+            };
+            traffic.push(UserTraffic {
+                uid,
+                email,
+                upload: i64::try_from(up).unwrap_or(i64::MAX),
+                download: i64::try_from(down).unwrap_or(i64::MAX),
+            });
+            taken.push((counter, up, down));
         }
 
         if traffic.is_empty() {
@@ -332,6 +337,14 @@ fn users_differ(old: &[UserInfo], new: &[UserInfo]) -> bool {
     }
     let set: HashSet<&UserInfo> = old.iter().collect();
     new.iter().any(|u| !set.contains(u))
+}
+
+fn parse_user_tag(node_tag: &str, tag: &str) -> Option<(i32, CompactString)> {
+    let prefix = format!("{node_tag}|");
+    let rest = tag.strip_prefix(&prefix)?;
+    let (email, uid) = rest.rsplit_once('|')?;
+    let uid = uid.parse::<i32>().ok()?;
+    Some((uid, CompactString::new(email)))
 }
 
 #[cfg(test)]

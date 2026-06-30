@@ -5,8 +5,11 @@
 //! per-security AEAD chunk body with optional SHAKE128 length masking + padding.
 //! `flow=none` equivalent; Mux (cmd 3) is out of scope (deferred with XUDP/mux).
 
+use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes::Aes128;
@@ -20,6 +23,7 @@ use sha2::{Digest, Sha256};
 use shake::digest::{ExtendableOutput, Update as _, XofReader};
 use shake::{Shake128, Shake128Reader};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use kernel::types::error::Error;
@@ -28,8 +32,8 @@ use kernel::{Ctx, Destination, Dispatcher, Network, Policy, Timer, Uuid};
 use transport::Stream;
 
 use crate::ProxyInbound;
-use crate::io::{ChunkRead, ChunkWrite, relay_framed, user_counter};
 use crate::crypto::{Aead, AeadKind};
+use crate::io::{ChunkRead, ChunkWrite, relay_framed, user_counter};
 
 const MAGIC: &[u8] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
 const KDF_SALT: &[u8] = b"VMess AEAD KDF";
@@ -53,6 +57,22 @@ const SEC_NONE: u8 = 5;
 const CMD_TCP: u8 = 1;
 const CMD_UDP: u8 = 2;
 const CMD_MUX: u8 = 3;
+
+const VMESS_AUTH_CACHE_MAX: usize = 8192;
+
+static VMESS_AUTH_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn vmess_auth_limiter() -> Arc<Semaphore> {
+    VMESS_AUTH_LIMITER
+        .get_or_init(|| {
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            let permits = cpus.saturating_mul(2).clamp(4, 128);
+            Arc::new(Semaphore::new(permits))
+        })
+        .clone()
+}
 
 // ---------------------------------------------------------------------------
 // Primitives
@@ -210,6 +230,12 @@ pub struct VmessUser {
     pub level: u32,
 }
 
+struct VmessAuth {
+    index: usize,
+    cmd_key: [u8; 16],
+    email: CompactString,
+}
+
 /// Immutable VMess user table.
 pub struct VmessUsers {
     users: Vec<VmessUser>,
@@ -236,40 +262,49 @@ impl VmessUsers {
         Ok(VmessUsers { users: out })
     }
 
-    /// Trial-match a 16-byte authID against all users (AES-ECB + CRC + time).
-    fn match_user(&self, authid: &[u8; 16]) -> Option<&VmessUser> {
+    fn match_one(index: usize, user: &VmessUser, authid: &[u8; 16], now: i64) -> Option<VmessAuth> {
+        let mut block = aes::cipher::Block::<Aes128>::from(*authid);
+        user.authid_cipher.decrypt_block(&mut block);
+        let plain: &[u8] = block.as_ref();
+        let (ts_bytes, rest) = plain.split_at_checked(8)?;
+        let crc_field = rest.get(4..8).and_then(|b| <[u8; 4]>::try_from(b).ok())?;
+        let crc_field = u32::from_be_bytes(crc_field);
+        let check = crc32fast::hash(plain.get(..12)?);
+        if crc_field != check {
+            return None;
+        }
+        let ts = ts_bytes.try_into().ok()?;
+        let t = i64::from_be_bytes(ts);
+        if (now.saturating_sub(t)).abs() > 120 {
+            return None;
+        }
+        Some(VmessAuth {
+            index,
+            cmd_key: user.cmd_key,
+            email: user.email.clone(),
+        })
+    }
+
+    /// Trial-match a 16-byte authID against users (AES-ECB + CRC + time).
+    fn match_user(&self, authid: &[u8; 16], preferred: Option<usize>) -> Option<VmessAuth> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_secs()).ok())
             .unwrap_or(0);
-        for user in &self.users {
-            let mut block = aes::cipher::Block::<Aes128>::from(*authid);
-            user.authid_cipher.decrypt_block(&mut block);
-            let plain: &[u8] = block.as_ref();
-            let (ts_bytes, rest) = match plain.split_at_checked(8) {
-                Some(v) => v,
-                None => continue,
-            };
-            let crc_field = match rest.get(4..8).and_then(|b| <[u8; 4]>::try_from(b).ok()) {
-                Some(b) => u32::from_be_bytes(b),
-                None => continue,
-            };
-            let check = match plain.get(..12) {
-                Some(b) => crc32fast::hash(b),
-                None => continue,
-            };
-            if crc_field != check {
+        if let Some(index) = preferred
+            && let Some(user) = self.users.get(index)
+            && let Some(matched) = Self::match_one(index, user, authid, now)
+        {
+            return Some(matched);
+        }
+        for (index, user) in self.users.iter().enumerate() {
+            if Some(index) == preferred {
                 continue;
             }
-            let ts: [u8; 8] = match ts_bytes.try_into() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let t = i64::from_be_bytes(ts);
-            if (now.saturating_sub(t)).abs() > 120 {
-                continue;
+            if let Some(matched) = Self::match_one(index, user, authid, now) {
+                return Some(matched);
             }
-            return Some(user);
         }
         None
     }
@@ -501,18 +536,29 @@ struct Request {
 /// VMess inbound handler.
 pub struct Vmess {
     users: arc_swap::ArcSwap<VmessUsers>,
+    recent_users: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    auth_failures: AtomicU64,
 }
 
 impl Vmess {
     pub fn new(users: Arc<VmessUsers>) -> Vmess {
         Vmess {
             users: arc_swap::ArcSwap::from(users),
+            recent_users: Arc::new(Mutex::new(HashMap::new())),
+            auth_failures: AtomicU64::new(0),
         }
     }
 
     /// Swap in a new user table (live user sync, SPEC §P2).
     pub fn set_users(&self, users: Arc<VmessUsers>) {
         self.users.store(users);
+        if let Ok(mut cache) = self.recent_users.lock() {
+            cache.clear();
+        }
+    }
+
+    pub fn auth_failures(&self) -> u64 {
+        self.auth_failures.load(Ordering::Relaxed)
     }
 
     pub async fn process(
@@ -522,7 +568,7 @@ impl Vmess {
         disp: &Dispatcher,
         policy: &Policy,
     ) -> io::Result<()> {
-        let req = timeout(policy.handshake, self.read_header(&mut conn))
+        let req = timeout(policy.handshake, self.read_header(ctx, &mut conn))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
         let ctx = ctx.with_user(req.email.clone());
@@ -625,19 +671,51 @@ impl Vmess {
         relay_framed(conn, up, down, link, timer, counter, Bytes::new()).await
     }
 
-    async fn read_header<R>(&self, conn: &mut R) -> io::Result<Request>
+    async fn read_header<R>(&self, ctx: &Ctx, conn: &mut R) -> io::Result<Request>
     where
         R: AsyncRead + Unpin,
     {
         let mut authid = [0u8; 16];
         conn.read_exact(&mut authid).await?;
-        let (cmd_key, email) = {
-            let users = self.users.load();
-            let user = users
-                .match_user(&authid)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "vmess auth"))?;
-            (user.cmd_key, user.email.clone())
+        let users = self.users.load_full();
+        let recent = self.recent_users.clone();
+        let peer = ctx.source.map(|s| s.ip());
+        let failures = &self.auth_failures;
+        let permit = vmess_auth_limiter()
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::other("vmess auth limiter closed"))?;
+        let matched = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let preferred =
+                peer.and_then(|ip| recent.lock().ok().and_then(|c| c.get(&ip).copied()));
+            let matched = users.match_user(&authid, preferred);
+            if let Some(m) = &matched
+                && let Some(ip) = peer
+                && let Ok(mut cache) = recent.lock()
+            {
+                if cache.len() >= VMESS_AUTH_CACHE_MAX && !cache.contains_key(&ip) {
+                    cache.clear();
+                }
+                cache.insert(ip, m.index);
+            }
+            matched
+        })
+        .await
+        .map_err(io::Error::other)?;
+        let matched = match matched {
+            Some(m) => m,
+            None => {
+                failures.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    session = ctx.id,
+                    failures = failures.load(Ordering::Relaxed),
+                    "vmess auth failed"
+                );
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "vmess auth"));
+            }
         };
+        let (cmd_key, email) = (matched.cmd_key, matched.email);
 
         // [sealed length 18][connection nonce 8]
         let mut lenct = [0u8; 18];
@@ -776,5 +854,121 @@ impl AdvanceFixed for Bytes {
     fn advance_fixed(&mut self, n: usize) -> Result<(), Error> {
         let _ = net::take(self, n)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod tests {
+    use super::*;
+    use aes::cipher::BlockCipherEncrypt;
+    use std::time::Instant;
+
+    fn auth_id(uuid: &Uuid, ts: i64, nonce: [u8; 4]) -> [u8; 16] {
+        let ck = cmd_key(uuid);
+        let authid_key = kdf16(&ck, &[SALT_AUTHID]);
+        let cipher = <Aes128 as aes::cipher::KeyInit>::new_from_slice(&authid_key).expect("aes");
+        let mut plain = [0u8; 16];
+        plain[..8].copy_from_slice(&ts.to_be_bytes());
+        plain[8..12].copy_from_slice(&nonce);
+        let crc = crc32fast::hash(&plain[..12]);
+        plain[12..16].copy_from_slice(&crc.to_be_bytes());
+        let mut block = aes::cipher::Block::<Aes128>::from(plain);
+        cipher.encrypt_block(&mut block);
+        block.into()
+    }
+
+    fn uuid(text: &str) -> Uuid {
+        Uuid::parse_str(text).expect("uuid")
+    }
+
+    fn uuid_from_index(index: u64) -> Uuid {
+        let mut b = [0u8; 16];
+        b[8..16].copy_from_slice(&index.to_be_bytes());
+        Uuid(b)
+    }
+
+    #[test]
+    fn vmess_auth_uses_preferred_user_fast_path() {
+        let a = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
+        let b = uuid("7cd0a7b7-7b3a-4d61-ae0b-5f0f77f2f04f");
+        let table = VmessUsers::new([
+            (a, CompactString::new("a@example.test"), 0),
+            (b, CompactString::new("b@example.test"), 0),
+        ])
+        .expect("users");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let authid = auth_id(&b, i64::try_from(now).expect("time range"), [1, 2, 3, 4]);
+        let matched = table.match_user(&authid, Some(1)).expect("match");
+        assert_eq!(matched.index, 1);
+        assert_eq!(matched.email, "b@example.test");
+    }
+
+    #[test]
+    fn vmess_auth_falls_back_after_wrong_preferred_user() {
+        let a = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
+        let b = uuid("7cd0a7b7-7b3a-4d61-ae0b-5f0f77f2f04f");
+        let table = VmessUsers::new([
+            (a, CompactString::new("a@example.test"), 0),
+            (b, CompactString::new("b@example.test"), 0),
+        ])
+        .expect("users");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let authid = auth_id(&b, i64::try_from(now).expect("time range"), [5, 6, 7, 8]);
+        let matched = table.match_user(&authid, Some(0)).expect("match");
+        assert_eq!(matched.index, 1);
+        assert_eq!(matched.email, "b@example.test");
+    }
+
+    #[test]
+    #[ignore = "manual VMess auth table timing baseline"]
+    fn vmess_auth_table_size_baseline() {
+        for size in [1_000usize, 10_000, 50_000] {
+            let mut users = Vec::with_capacity(size);
+            for i in 0..size {
+                let id = uuid_from_index(u64::try_from(i).expect("index range"));
+                users.push((id, CompactString::new(format!("u{i}@example.test")), 0));
+            }
+            let target_index = size - 1;
+            let target = uuid_from_index(u64::try_from(target_index).expect("index range"));
+            let table = VmessUsers::new(users).expect("users");
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_secs();
+            let authid = auth_id(
+                &target,
+                i64::try_from(now).expect("time range"),
+                [9, 8, 7, 6],
+            );
+
+            let fallback_start = Instant::now();
+            let fallback = table.match_user(&authid, None).expect("fallback match");
+            let fallback_elapsed = fallback_start.elapsed();
+            assert_eq!(fallback.index, target_index);
+
+            let preferred_start = Instant::now();
+            let preferred = table
+                .match_user(&authid, Some(target_index))
+                .expect("preferred match");
+            let preferred_elapsed = preferred_start.elapsed();
+            assert_eq!(preferred.index, target_index);
+
+            eprintln!(
+                "vmess auth users={size} fallback={fallback_elapsed:?} preferred={preferred_elapsed:?}"
+            );
+        }
     }
 }
