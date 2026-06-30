@@ -1,4 +1,3 @@
-use crate::function_util::SimpleService;
 use std::pin::Pin;
 use std::sync::mpsc;
 use std::task::{Context, Poll};
@@ -102,12 +101,10 @@ pub enum Accepted<T: AsyncRead + AsyncWrite + Unpin> {
     Multiplexed(mpsc::Receiver<TransportStream<T>>),
 }
 
-pub trait InboundTransport<T: AsyncRead + AsyncWrite + Unpin + Send>:
-    SimpleService<
-        InboundConnection<T>,
-        Output = TransportStream<Self::StreamTy>,
-        Error = std::io::Error,
-    >
-{
+pub trait InboundTransport<T: AsyncRead + AsyncWrite + Unpin + Send> {
     type StreamTy: AsyncRead + AsyncWrite + Unpin;
+    fn call(
+        &self,
+        conn: InboundConnection<T>,
+    ) -> impl Future<Output = std::io::Result<Accepted<Self::StreamTy>>> + Send;
 }
