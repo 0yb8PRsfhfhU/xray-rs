@@ -139,4 +139,3 @@ where
         self.0.swap_arc(new.into_iter().collect::<Arc<[T]>>());
     }
 }
-

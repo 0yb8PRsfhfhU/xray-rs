@@ -1,5 +1,4 @@
 use crate::config::KernelConfig;
-use crate::function_util::SimpleService;
 use crate::pipe::inbound_transport::{InboundList, InboundTransport};
 use crate::runtime::dialer::{TcpDialer, UdpDialer};
 use crate::runtime::service_stack::ReactiveServiceStack;

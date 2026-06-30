@@ -18,8 +18,8 @@ pub trait ParentService<SubService: ReactiveServiceStack>:
     Send + Sync + ReactiveServiceStack
 {
     type Requirement;
-    fn provide_context(&self) -> SubService::BottomContext;
-    fn provide_children_context(
+    fn everything_lower(&self) -> SubService::BottomContext;
+    fn provide_layer(
         &self,
         req: Self::Requirement,
     ) -> (
