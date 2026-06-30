@@ -5,7 +5,7 @@
 //! per-security AEAD chunk body with optional SHAKE128 length masking + padding.
 //! `flow=none` equivalent; Mux (cmd 3) is out of scope (deferred with XUDP/mux).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +59,7 @@ const CMD_UDP: u8 = 2;
 const CMD_MUX: u8 = 3;
 
 const VMESS_AUTH_CACHE_MAX: usize = 8192;
+const VMESS_ACTIVE_AUTH_MAX: usize = 4096;
 
 static VMESS_AUTH_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -234,6 +235,14 @@ struct VmessAuth {
     index: usize,
     cmd_key: [u8; 16],
     email: CompactString,
+    kind: VmessAuthKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VmessAuthKind {
+    Preferred,
+    Active,
+    Fallback,
 }
 
 /// Immutable VMess user table.
@@ -262,7 +271,13 @@ impl VmessUsers {
         Ok(VmessUsers { users: out })
     }
 
-    fn match_one(index: usize, user: &VmessUser, authid: &[u8; 16], now: i64) -> Option<VmessAuth> {
+    fn match_one(
+        index: usize,
+        user: &VmessUser,
+        authid: &[u8; 16],
+        now: i64,
+        kind: VmessAuthKind,
+    ) -> Option<VmessAuth> {
         let mut block = aes::cipher::Block::<Aes128>::from(*authid);
         user.authid_cipher.decrypt_block(&mut block);
         let plain: &[u8] = block.as_ref();
@@ -282,32 +297,79 @@ impl VmessUsers {
             index,
             cmd_key: user.cmd_key,
             email: user.email.clone(),
+            kind,
         })
     }
 
     /// Trial-match a 16-byte authID against users (AES-ECB + CRC + time).
-    fn match_user(&self, authid: &[u8; 16], preferred: Option<usize>) -> Option<VmessAuth> {
+    fn match_user(
+        &self,
+        authid: &[u8; 16],
+        preferred: Option<usize>,
+        active: &[usize],
+    ) -> Option<VmessAuth> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
             .and_then(|d| i64::try_from(d.as_secs()).ok())
             .unwrap_or(0);
+        let mut tried = if preferred.is_some() || !active.is_empty() {
+            Some(vec![false; self.users.len()])
+        } else {
+            None
+        };
         if let Some(index) = preferred
             && let Some(user) = self.users.get(index)
-            && let Some(matched) = Self::match_one(index, user, authid, now)
         {
-            return Some(matched);
+            mark_tried(&mut tried, index);
+            if let Some(matched) =
+                Self::match_one(index, user, authid, now, VmessAuthKind::Preferred)
+            {
+                return Some(matched);
+            }
         }
-        for (index, user) in self.users.iter().enumerate() {
-            if Some(index) == preferred {
+        for index in active {
+            let index = *index;
+            if was_tried(&tried, index) {
                 continue;
             }
-            if let Some(matched) = Self::match_one(index, user, authid, now) {
+            let Some(user) = self.users.get(index) else {
+                continue;
+            };
+            mark_tried(&mut tried, index);
+            if let Some(matched) = Self::match_one(index, user, authid, now, VmessAuthKind::Active)
+            {
+                return Some(matched);
+            }
+        }
+        for (index, user) in self.users.iter().enumerate() {
+            if was_tried(&tried, index) {
+                continue;
+            }
+            if let Some(matched) =
+                Self::match_one(index, user, authid, now, VmessAuthKind::Fallback)
+            {
                 return Some(matched);
             }
         }
         None
     }
+}
+
+fn mark_tried(tried: &mut Option<Vec<bool>>, index: usize) {
+    if let Some(tried) = tried
+        && let Some(slot) = tried.get_mut(index)
+    {
+        *slot = true;
+    }
+}
+
+fn was_tried(tried: &Option<Vec<bool>>, index: usize) -> bool {
+    tried
+        .as_ref()
+        .and_then(|t| t.get(index))
+        .copied()
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +599,10 @@ struct Request {
 pub struct Vmess {
     users: arc_swap::ArcSwap<VmessUsers>,
     recent_users: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    active_users: Arc<Mutex<VecDeque<usize>>>,
+    auth_preferred_hits: AtomicU64,
+    auth_active_hits: AtomicU64,
+    auth_fallback_hits: AtomicU64,
     auth_failures: AtomicU64,
 }
 
@@ -545,6 +611,10 @@ impl Vmess {
         Vmess {
             users: arc_swap::ArcSwap::from(users),
             recent_users: Arc::new(Mutex::new(HashMap::new())),
+            active_users: Arc::new(Mutex::new(VecDeque::new())),
+            auth_preferred_hits: AtomicU64::new(0),
+            auth_active_hits: AtomicU64::new(0),
+            auth_fallback_hits: AtomicU64::new(0),
             auth_failures: AtomicU64::new(0),
         }
     }
@@ -555,10 +625,59 @@ impl Vmess {
         if let Ok(mut cache) = self.recent_users.lock() {
             cache.clear();
         }
+        if let Ok(mut active) = self.active_users.lock() {
+            active.clear();
+        }
+    }
+
+    pub fn auth_preferred_hits(&self) -> u64 {
+        self.auth_preferred_hits.load(Ordering::Relaxed)
+    }
+
+    pub fn auth_active_hits(&self) -> u64 {
+        self.auth_active_hits.load(Ordering::Relaxed)
+    }
+
+    pub fn auth_fallback_hits(&self) -> u64 {
+        self.auth_fallback_hits.load(Ordering::Relaxed)
     }
 
     pub fn auth_failures(&self) -> u64 {
         self.auth_failures.load(Ordering::Relaxed)
+    }
+
+    fn active_user_snapshot(&self) -> Vec<usize> {
+        self.active_users
+            .lock()
+            .map(|active| active.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn remember_active_user(&self, index: usize) {
+        let Ok(mut active) = self.active_users.lock() else {
+            return;
+        };
+        if let Some(pos) = active.iter().position(|i| *i == index) {
+            let _ = active.remove(pos);
+        }
+        active.push_front(index);
+        if active.len() > VMESS_ACTIVE_AUTH_MAX {
+            let _ = active.pop_back();
+        }
+    }
+
+    fn record_auth_hit(&self, kind: VmessAuthKind) {
+        match kind {
+            VmessAuthKind::Preferred => {
+                self.auth_preferred_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            VmessAuthKind::Active => {
+                self.auth_active_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            VmessAuthKind::Fallback => {
+                self.auth_fallback_hits.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     pub async fn process(
@@ -678,8 +797,14 @@ impl Vmess {
         let mut authid = [0u8; 16];
         conn.read_exact(&mut authid).await?;
         let users = self.users.load_full();
-        let recent = self.recent_users.clone();
         let peer = ctx.source.map(|s| s.ip());
+        let preferred = peer.and_then(|ip| {
+            self.recent_users
+                .lock()
+                .ok()
+                .and_then(|c| c.get(&ip).copied())
+        });
+        let active = self.active_user_snapshot();
         let failures = &self.auth_failures;
         let permit = vmess_auth_limiter()
             .acquire_owned()
@@ -687,19 +812,7 @@ impl Vmess {
             .map_err(|_| io::Error::other("vmess auth limiter closed"))?;
         let matched = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let preferred =
-                peer.and_then(|ip| recent.lock().ok().and_then(|c| c.get(&ip).copied()));
-            let matched = users.match_user(&authid, preferred);
-            if let Some(m) = &matched
-                && let Some(ip) = peer
-                && let Ok(mut cache) = recent.lock()
-            {
-                if cache.len() >= VMESS_AUTH_CACHE_MAX && !cache.contains_key(&ip) {
-                    cache.clear();
-                }
-                cache.insert(ip, m.index);
-            }
-            matched
+            users.match_user(&authid, preferred, &active)
         })
         .await
         .map_err(io::Error::other)?;
@@ -715,6 +828,16 @@ impl Vmess {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "vmess auth"));
             }
         };
+        self.record_auth_hit(matched.kind);
+        self.remember_active_user(matched.index);
+        if let Some(ip) = peer
+            && let Ok(mut cache) = self.recent_users.lock()
+        {
+            if cache.len() >= VMESS_AUTH_CACHE_MAX && !cache.contains_key(&ip) {
+                cache.clear();
+            }
+            cache.insert(ip, matched.index);
+        }
         let (cmd_key, email) = (matched.cmd_key, matched.email);
 
         // [sealed length 18][connection nonce 8]
@@ -908,9 +1031,30 @@ mod tests {
             .expect("time")
             .as_secs();
         let authid = auth_id(&b, i64::try_from(now).expect("time range"), [1, 2, 3, 4]);
-        let matched = table.match_user(&authid, Some(1)).expect("match");
+        let matched = table.match_user(&authid, Some(1), &[]).expect("match");
         assert_eq!(matched.index, 1);
         assert_eq!(matched.email, "b@example.test");
+        assert_eq!(matched.kind, VmessAuthKind::Preferred);
+    }
+
+    #[test]
+    fn vmess_auth_uses_active_hotset_before_fallback() {
+        let a = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
+        let b = uuid("7cd0a7b7-7b3a-4d61-ae0b-5f0f77f2f04f");
+        let table = VmessUsers::new([
+            (a, CompactString::new("a@example.test"), 0),
+            (b, CompactString::new("b@example.test"), 0),
+        ])
+        .expect("users");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let authid = auth_id(&b, i64::try_from(now).expect("time range"), [2, 3, 4, 5]);
+        let matched = table.match_user(&authid, Some(0), &[1]).expect("match");
+        assert_eq!(matched.index, 1);
+        assert_eq!(matched.email, "b@example.test");
+        assert_eq!(matched.kind, VmessAuthKind::Active);
     }
 
     #[test]
@@ -927,9 +1071,58 @@ mod tests {
             .expect("time")
             .as_secs();
         let authid = auth_id(&b, i64::try_from(now).expect("time range"), [5, 6, 7, 8]);
-        let matched = table.match_user(&authid, Some(0)).expect("match");
+        let matched = table.match_user(&authid, Some(0), &[]).expect("match");
         assert_eq!(matched.index, 1);
         assert_eq!(matched.email, "b@example.test");
+        assert_eq!(matched.kind, VmessAuthKind::Fallback);
+    }
+
+    #[test]
+    fn vmess_auth_falls_back_after_bad_active_hotset() {
+        let a = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
+        let b = uuid("7cd0a7b7-7b3a-4d61-ae0b-5f0f77f2f04f");
+        let table = VmessUsers::new([
+            (a, CompactString::new("a@example.test"), 0),
+            (b, CompactString::new("b@example.test"), 0),
+        ])
+        .expect("users");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let authid = auth_id(&b, i64::try_from(now).expect("time range"), [6, 7, 8, 9]);
+        let matched = table
+            .match_user(&authid, None, &[usize::MAX, 0])
+            .expect("match");
+        assert_eq!(matched.index, 1);
+        assert_eq!(matched.email, "b@example.test");
+        assert_eq!(matched.kind, VmessAuthKind::Fallback);
+    }
+
+    #[test]
+    fn vmess_set_users_clears_auth_caches() {
+        let a = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
+        let b = uuid("7cd0a7b7-7b3a-4d61-ae0b-5f0f77f2f04f");
+        let handler = Vmess::new(Arc::new(
+            VmessUsers::new([(a, CompactString::new("a@example.test"), 0)]).expect("users"),
+        ));
+        handler
+            .recent_users
+            .lock()
+            .expect("recent lock")
+            .insert(std::net::Ipv4Addr::LOCALHOST.into(), 0);
+        handler
+            .active_users
+            .lock()
+            .expect("active lock")
+            .push_front(0);
+
+        handler.set_users(Arc::new(
+            VmessUsers::new([(b, CompactString::new("b@example.test"), 0)]).expect("users"),
+        ));
+
+        assert!(handler.recent_users.lock().expect("recent lock").is_empty());
+        assert!(handler.active_users.lock().expect("active lock").is_empty());
     }
 
     #[test]
@@ -955,19 +1148,28 @@ mod tests {
             );
 
             let fallback_start = Instant::now();
-            let fallback = table.match_user(&authid, None).expect("fallback match");
+            let fallback = table
+                .match_user(&authid, None, &[])
+                .expect("fallback match");
             let fallback_elapsed = fallback_start.elapsed();
             assert_eq!(fallback.index, target_index);
 
             let preferred_start = Instant::now();
             let preferred = table
-                .match_user(&authid, Some(target_index))
+                .match_user(&authid, Some(target_index), &[])
                 .expect("preferred match");
             let preferred_elapsed = preferred_start.elapsed();
             assert_eq!(preferred.index, target_index);
 
+            let active_start = Instant::now();
+            let active = table
+                .match_user(&authid, None, &[target_index])
+                .expect("active match");
+            let active_elapsed = active_start.elapsed();
+            assert_eq!(active.index, target_index);
+
             eprintln!(
-                "vmess auth users={size} fallback={fallback_elapsed:?} preferred={preferred_elapsed:?}"
+                "vmess auth users={size} fallback={fallback_elapsed:?} preferred={preferred_elapsed:?} active={active_elapsed:?}"
             );
         }
     }
