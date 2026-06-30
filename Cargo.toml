@@ -4,7 +4,7 @@ members = ["kernel", "proxy", "transport", "app", "saas", "new_kernel"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.1-alpha"
+version = "0.1.5-alpha"
 license = "unfree"
 
 [workspace.dependencies]
