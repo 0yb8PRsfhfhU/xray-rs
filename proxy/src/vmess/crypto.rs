@@ -127,14 +127,24 @@ pub(crate) fn kdf16(key: &[u8], paths: &[&[u8]]) -> [u8; 16] {
     out
 }
 
-pub(crate) fn aes128gcm_open(key: &[u8], nonce: &[u8], ct: &[u8], aad: &[u8]) -> io::Result<Vec<u8>> {
+pub(crate) fn aes128gcm_open(
+    key: &[u8],
+    nonce: &[u8],
+    ct: &[u8],
+    aad: &[u8],
+) -> io::Result<Vec<u8>> {
     let cipher = Aes128Gcm::new_from_slice(key).map_err(|_| io::Error::other("gcm key"))?;
     cipher
         .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad })
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "vmess header open"))
 }
 
-pub(crate) fn aes128gcm_seal(key: &[u8], nonce: &[u8], pt: &[u8], aad: &[u8]) -> io::Result<Vec<u8>> {
+pub(crate) fn aes128gcm_seal(
+    key: &[u8],
+    nonce: &[u8],
+    pt: &[u8],
+    aad: &[u8],
+) -> io::Result<Vec<u8>> {
     let cipher = Aes128Gcm::new_from_slice(key).map_err(|_| io::Error::other("gcm key"))?;
     cipher
         .encrypt(Nonce::from_slice(nonce), Payload { msg: pt, aad })

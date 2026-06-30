@@ -258,7 +258,9 @@ mod tests {
         for p in payloads {
             write_chunk(&mut wire, &mut writer, p).await.expect("write");
         }
-        write_terminal(&mut wire, &mut writer).await.expect("terminal");
+        write_terminal(&mut wire, &mut writer)
+            .await
+            .expect("terminal");
 
         let mut src: &[u8] = &wire;
         let mut out = Vec::new();
