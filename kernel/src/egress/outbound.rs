@@ -354,9 +354,7 @@ impl SsAeadKind {
             "chacha20-ietf-poly1305" | "chacha20-poly1305" | "AEAD_CHACHA20_POLY1305" => {
                 Some(SsAeadKind::ChaCha20Poly1305)
             }
-            "xchacha20-ietf-poly1305" | "xchacha20-poly1305" => {
-                Some(SsAeadKind::XChaCha20Poly1305)
-            }
+            "xchacha20-ietf-poly1305" | "xchacha20-poly1305" => Some(SsAeadKind::XChaCha20Poly1305),
             _ => None,
         }
     }

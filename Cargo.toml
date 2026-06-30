@@ -4,7 +4,7 @@ members = ["kernel", "proxy", "transport", "app", "saas", "new_kernel"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.5-alpha"
+version = "0.1.7-alpha"
 license = "unfree"
 
 [workspace.dependencies]
@@ -23,11 +23,11 @@ bytes = "1"
 # data values
 compact_str = "0.9"
 smallvec = "1.15"
-arc-swap = "1"
+arc-swap = "1.9.2"
 parking_lot = "0.12"
 moka = { version = "0.12", features = ["future"] }
 thiserror = "2"
-anyhow = "1"
+anyhow = "1.0.103"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.10"

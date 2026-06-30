@@ -114,8 +114,14 @@ mod tests {
 
         assert!(cfg.enable);
         assert_eq!(cfg.routes.len(), 3);
-        assert!(matches!(cfg.routes[0].outs.first(), Some(OutSpec::Shadowsocks { .. })));
-        assert!(matches!(cfg.routes[1].outs.first(), Some(OutSpec::Socks { .. })));
+        assert!(matches!(
+            cfg.routes[0].outs.first(),
+            Some(OutSpec::Shadowsocks { .. })
+        ));
+        assert!(matches!(
+            cfg.routes[1].outs.first(),
+            Some(OutSpec::Socks { .. })
+        ));
         assert!(matches!(cfg.routes[2].outs.first(), Some(OutSpec::Direct)));
     }
 }

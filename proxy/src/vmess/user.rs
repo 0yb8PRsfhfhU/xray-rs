@@ -1,6 +1,6 @@
 //! VMess user table and authID trial matching. The hot path first tries the
-//! peer's recent user, then the active-user hotset, then falls back to a full
-//! scan without retrying indices already tested in earlier passes.
+//! active-user hotset, then falls back to a full scan without retrying indices
+//! already tested in the hotset pass.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,7 +30,6 @@ pub(crate) struct VmessAuth {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VmessAuthKind {
-    Preferred,
     Active,
     Fallback,
 }
@@ -80,7 +79,7 @@ impl VmessUsers {
         }
         let ts = ts_bytes.try_into().ok()?;
         let t = i64::from_be_bytes(ts);
-        if (now.saturating_sub(t)).abs() > 120 {
+        if t < 0 || now.abs_diff(t) > 120 {
             return None;
         }
         Some(VmessAuth {
@@ -92,28 +91,13 @@ impl VmessUsers {
     }
 
     /// Trial-match a 16-byte authID against users (AES-ECB + CRC + time).
-    pub(crate) fn match_user(
-        &self,
-        authid: &[u8; 16],
-        preferred: Option<usize>,
-        active: &[usize],
-    ) -> Option<VmessAuth> {
+    pub(crate) fn match_user(&self, authid: &[u8; 16], active: &[usize]) -> Option<VmessAuth> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
             .and_then(|d| i64::try_from(d.as_secs()).ok())
             .unwrap_or(0);
-        let mut tried = TriedSet::new(preferred.is_some() || !active.is_empty(), self.users.len());
-        if let Some(index) = preferred
-            && let Some(user) = self.users.get(index)
-        {
-            tried.mark(index);
-            if let Some(matched) =
-                Self::match_one(index, user, authid, now, VmessAuthKind::Preferred)
-            {
-                return Some(matched);
-            }
-        }
+        let mut tried = TriedSet::new(!active.is_empty(), self.users.len());
         for index in active {
             let index = *index;
             if tried.contains(index) {
@@ -143,7 +127,7 @@ impl VmessUsers {
 }
 
 /// Tracks which user indices have already been trial-decrypted, so the
-/// preferred/active passes never re-test a user that the fallback scan repeats.
+/// active pass never re-tests a user that the fallback scan repeats.
 /// `None` means "track nothing": the fallback-only path visits each index once.
 struct TriedSet(Option<Vec<bool>>);
 
@@ -209,26 +193,6 @@ mod tests {
     }
 
     #[test]
-    fn vmess_auth_uses_preferred_user_fast_path() {
-        let a = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
-        let b = uuid("7cd0a7b7-7b3a-4d61-ae0b-5f0f77f2f04f");
-        let table = VmessUsers::new([
-            (a, CompactString::new("a@example.test"), 0),
-            (b, CompactString::new("b@example.test"), 0),
-        ])
-        .expect("users");
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_secs();
-        let authid = auth_id(&b, i64::try_from(now).expect("time range"), [1, 2, 3, 4]);
-        let matched = table.match_user(&authid, Some(1), &[]).expect("match");
-        assert_eq!(matched.index, 1);
-        assert_eq!(matched.email, "b@example.test");
-        assert_eq!(matched.kind, VmessAuthKind::Preferred);
-    }
-
-    #[test]
     fn vmess_auth_uses_active_hotset_before_fallback() {
         let a = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
         let b = uuid("7cd0a7b7-7b3a-4d61-ae0b-5f0f77f2f04f");
@@ -242,14 +206,14 @@ mod tests {
             .expect("time")
             .as_secs();
         let authid = auth_id(&b, i64::try_from(now).expect("time range"), [2, 3, 4, 5]);
-        let matched = table.match_user(&authid, Some(0), &[1]).expect("match");
+        let matched = table.match_user(&authid, &[1]).expect("match");
         assert_eq!(matched.index, 1);
         assert_eq!(matched.email, "b@example.test");
         assert_eq!(matched.kind, VmessAuthKind::Active);
     }
 
     #[test]
-    fn vmess_auth_falls_back_after_wrong_preferred_user() {
+    fn vmess_auth_falls_back_without_active_hit() {
         let a = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
         let b = uuid("7cd0a7b7-7b3a-4d61-ae0b-5f0f77f2f04f");
         let table = VmessUsers::new([
@@ -262,7 +226,7 @@ mod tests {
             .expect("time")
             .as_secs();
         let authid = auth_id(&b, i64::try_from(now).expect("time range"), [5, 6, 7, 8]);
-        let matched = table.match_user(&authid, Some(0), &[]).expect("match");
+        let matched = table.match_user(&authid, &[]).expect("match");
         assert_eq!(matched.index, 1);
         assert_eq!(matched.email, "b@example.test");
         assert_eq!(matched.kind, VmessAuthKind::Fallback);
@@ -282,12 +246,38 @@ mod tests {
             .expect("time")
             .as_secs();
         let authid = auth_id(&b, i64::try_from(now).expect("time range"), [6, 7, 8, 9]);
-        let matched = table
-            .match_user(&authid, None, &[usize::MAX, 0])
-            .expect("match");
+        let matched = table.match_user(&authid, &[usize::MAX, 0]).expect("match");
         assert_eq!(matched.index, 1);
         assert_eq!(matched.email, "b@example.test");
         assert_eq!(matched.kind, VmessAuthKind::Fallback);
+    }
+
+    #[test]
+    fn vmess_auth_rejects_expired_timestamp() {
+        let id = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
+        let table =
+            VmessUsers::new([(id, CompactString::new("a@example.test"), 0)]).expect("users");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let ts = i64::try_from(now.saturating_sub(121)).expect("time range");
+        let authid = auth_id(&id, ts, [1, 1, 1, 1]);
+        assert!(table.match_user(&authid, &[]).is_none());
+    }
+
+    #[test]
+    fn vmess_auth_rejects_future_timestamp_outside_window() {
+        let id = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
+        let table =
+            VmessUsers::new([(id, CompactString::new("a@example.test"), 0)]).expect("users");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let ts = i64::try_from(now.saturating_add(121)).expect("time range");
+        let authid = auth_id(&id, ts, [2, 2, 2, 2]);
+        assert!(table.match_user(&authid, &[]).is_none());
     }
 
     #[test]
@@ -313,28 +303,19 @@ mod tests {
             );
 
             let fallback_start = Instant::now();
-            let fallback = table
-                .match_user(&authid, None, &[])
-                .expect("fallback match");
+            let fallback = table.match_user(&authid, &[]).expect("fallback match");
             let fallback_elapsed = fallback_start.elapsed();
             assert_eq!(fallback.index, target_index);
 
-            let preferred_start = Instant::now();
-            let preferred = table
-                .match_user(&authid, Some(target_index), &[])
-                .expect("preferred match");
-            let preferred_elapsed = preferred_start.elapsed();
-            assert_eq!(preferred.index, target_index);
-
             let active_start = Instant::now();
             let active = table
-                .match_user(&authid, None, &[target_index])
+                .match_user(&authid, &[target_index])
                 .expect("active match");
             let active_elapsed = active_start.elapsed();
             assert_eq!(active.index, target_index);
 
             eprintln!(
-                "vmess auth users={size} fallback={fallback_elapsed:?} preferred={preferred_elapsed:?} active={active_elapsed:?}"
+                "vmess auth users={size} fallback={fallback_elapsed:?} active={active_elapsed:?}"
             );
         }
     }

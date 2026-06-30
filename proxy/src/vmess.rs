@@ -5,11 +5,11 @@
 //! per-security AEAD chunk body with optional SHAKE128 length masking + padding.
 //! `flow=none` equivalent; Mux (cmd 3) is out of scope (deferred with XUDP/mux).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::io;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
@@ -35,8 +35,9 @@ const SEC_AES128_GCM: u8 = 3;
 const SEC_CHACHA20: u8 = 4;
 const SEC_NONE: u8 = 5;
 
-const VMESS_AUTH_CACHE_MAX: usize = 8192;
-const VMESS_ACTIVE_AUTH_MAX: usize = 4096;
+const VMESS_ACTIVE_AUTH_MAX: usize = 1024;
+const VMESS_AUTH_REPLAY_WINDOW_SECS: u64 = 120;
+const VMESS_AUTH_REPLAY_MAX: usize = 65_536;
 
 static VMESS_AUTH_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -52,6 +53,49 @@ fn vmess_auth_limiter() -> Arc<Semaphore> {
         .clone()
 }
 
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+struct ReplayEntry {
+    authid: [u8; 16],
+    expires_at: u64,
+}
+
+#[derive(Default)]
+struct ReplayFilter {
+    seen: HashSet<[u8; 16]>,
+    order: VecDeque<ReplayEntry>,
+}
+
+impl ReplayFilter {
+    fn check_insert(&mut self, authid: [u8; 16], now: u64) -> bool {
+        self.prune(now);
+        if self.seen.contains(&authid) || self.seen.len() >= VMESS_AUTH_REPLAY_MAX {
+            return false;
+        }
+        let expires_at = now.saturating_add(VMESS_AUTH_REPLAY_WINDOW_SECS);
+        let _ = self.seen.insert(authid);
+        self.order.push_back(ReplayEntry { authid, expires_at });
+        true
+    }
+
+    fn prune(&mut self, now: u64) {
+        while let Some(entry) = self.order.front() {
+            if entry.expires_at > now {
+                break;
+            }
+            let Some(entry) = self.order.pop_front() else {
+                break;
+            };
+            self.seen.remove(&entry.authid);
+        }
+    }
+}
+
 mod body;
 mod header;
 mod user;
@@ -64,9 +108,8 @@ pub use user::VmessUsers;
 /// VMess inbound handler.
 pub struct Vmess {
     users: arc_swap::ArcSwap<VmessUsers>,
-    recent_users: Arc<Mutex<HashMap<IpAddr, usize>>>,
     active_users: Arc<Mutex<VecDeque<usize>>>,
-    auth_preferred_hits: AtomicU64,
+    replay_filter: Arc<Mutex<ReplayFilter>>,
     auth_active_hits: AtomicU64,
     auth_fallback_hits: AtomicU64,
     auth_failures: AtomicU64,
@@ -76,9 +119,8 @@ impl Vmess {
     pub fn new(users: Arc<VmessUsers>) -> Vmess {
         Vmess {
             users: arc_swap::ArcSwap::from(users),
-            recent_users: Arc::new(Mutex::new(HashMap::new())),
             active_users: Arc::new(Mutex::new(VecDeque::new())),
-            auth_preferred_hits: AtomicU64::new(0),
+            replay_filter: Arc::new(Mutex::new(ReplayFilter::default())),
             auth_active_hits: AtomicU64::new(0),
             auth_fallback_hits: AtomicU64::new(0),
             auth_failures: AtomicU64::new(0),
@@ -88,16 +130,9 @@ impl Vmess {
     /// Swap in a new user table (live user sync, SPEC §P2).
     pub fn set_users(&self, users: Arc<VmessUsers>) {
         self.users.store(users);
-        if let Ok(mut cache) = self.recent_users.lock() {
-            cache.clear();
-        }
         if let Ok(mut active) = self.active_users.lock() {
             active.clear();
         }
-    }
-
-    pub fn auth_preferred_hits(&self) -> u64 {
-        self.auth_preferred_hits.load(Ordering::Relaxed)
     }
 
     pub fn auth_active_hits(&self) -> u64 {
@@ -134,9 +169,6 @@ impl Vmess {
 
     fn record_auth_hit(&self, kind: VmessAuthKind) {
         match kind {
-            VmessAuthKind::Preferred => {
-                self.auth_preferred_hits.fetch_add(1, Ordering::Relaxed);
-            }
             VmessAuthKind::Active => {
                 self.auth_active_hits.fetch_add(1, Ordering::Relaxed);
             }
@@ -144,6 +176,13 @@ impl Vmess {
                 self.auth_fallback_hits.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    fn remember_authid_once(&self, authid: [u8; 16]) -> io::Result<bool> {
+        self.replay_filter
+            .lock()
+            .map(|mut replay| replay.check_insert(authid, unix_now_secs()))
+            .map_err(|_| io::Error::other("vmess replay filter poisoned"))
     }
 
     pub async fn process(
@@ -188,13 +227,6 @@ impl Vmess {
         let mut authid = [0u8; 16];
         conn.read_exact(&mut authid).await?;
         let users = self.users.load_full();
-        let peer = ctx.source.map(|s| s.ip());
-        let preferred = peer.and_then(|ip| {
-            self.recent_users
-                .lock()
-                .ok()
-                .and_then(|c| c.get(&ip).copied())
-        });
         let active = self.active_user_snapshot();
         let failures = &self.auth_failures;
         let permit = vmess_auth_limiter()
@@ -203,7 +235,7 @@ impl Vmess {
             .map_err(|_| io::Error::other("vmess auth limiter closed"))?;
         let matched = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            users.match_user(&authid, preferred, &active)
+            users.match_user(&authid, &active)
         })
         .await
         .map_err(io::Error::other)?;
@@ -219,16 +251,17 @@ impl Vmess {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "vmess auth"));
             }
         };
+        if !self.remember_authid_once(authid)? {
+            failures.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                session = ctx.id,
+                failures = failures.load(Ordering::Relaxed),
+                "vmess auth replay"
+            );
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "vmess replay"));
+        }
         self.record_auth_hit(matched.kind);
         self.remember_active_user(matched.index);
-        if let Some(ip) = peer
-            && let Ok(mut cache) = self.recent_users.lock()
-        {
-            if cache.len() >= VMESS_AUTH_CACHE_MAX && !cache.contains_key(&ip) {
-                cache.clear();
-            }
-            cache.insert(ip, matched.index);
-        }
         let (cmd_key, email) = (matched.cmd_key, matched.email);
 
         // [sealed length 18][connection nonce 8]
@@ -405,17 +438,12 @@ mod tests {
     }
 
     #[test]
-    fn vmess_set_users_clears_auth_caches() {
+    fn vmess_set_users_clears_active_auth_hotset() {
         let a = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
         let b = uuid("7cd0a7b7-7b3a-4d61-ae0b-5f0f77f2f04f");
         let handler = Vmess::new(Arc::new(
             VmessUsers::new([(a, CompactString::new("a@example.test"), 0)]).expect("users"),
         ));
-        handler
-            .recent_users
-            .lock()
-            .expect("recent lock")
-            .insert(std::net::Ipv4Addr::LOCALHOST.into(), 0);
         handler
             .active_users
             .lock()
@@ -426,7 +454,51 @@ mod tests {
             VmessUsers::new([(b, CompactString::new("b@example.test"), 0)]).expect("users"),
         ));
 
-        assert!(handler.recent_users.lock().expect("recent lock").is_empty());
         assert!(handler.active_users.lock().expect("active lock").is_empty());
+    }
+
+    #[test]
+    fn vmess_replay_filter_accepts_once_and_rejects_replay() {
+        let mut filter = ReplayFilter::default();
+        let authid = [7u8; 16];
+
+        assert!(filter.check_insert(authid, 1000));
+        assert!(!filter.check_insert(authid, 1001));
+    }
+
+    #[test]
+    fn vmess_replay_filter_allows_authid_after_expiry() {
+        let mut filter = ReplayFilter::default();
+        let authid = [8u8; 16];
+
+        assert!(filter.check_insert(authid, 1000));
+        assert!(filter.check_insert(
+            authid,
+            1000u64.saturating_add(VMESS_AUTH_REPLAY_WINDOW_SECS)
+        ));
+    }
+
+    #[test]
+    fn vmess_auth_stats_record_active_and_fallback_hits() {
+        let id = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
+        let handler = Vmess::new(Arc::new(
+            VmessUsers::new([(id, CompactString::new("a@example.test"), 0)]).expect("users"),
+        ));
+
+        handler.record_auth_hit(VmessAuthKind::Active);
+        handler.record_auth_hit(VmessAuthKind::Fallback);
+        handler.remember_active_user(0);
+
+        assert_eq!(handler.auth_active_hits(), 1);
+        assert_eq!(handler.auth_fallback_hits(), 1);
+        assert_eq!(
+            handler
+                .active_users
+                .lock()
+                .expect("active lock")
+                .front()
+                .copied(),
+            Some(0)
+        );
     }
 }
