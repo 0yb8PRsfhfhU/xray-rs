@@ -14,3 +14,8 @@ impl Default for ConnectionPolicy {
         }
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct KernelConfig {
+    pub connection_policy: ConnectionPolicy,
+}

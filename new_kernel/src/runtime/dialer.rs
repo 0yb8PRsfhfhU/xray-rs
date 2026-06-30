@@ -68,7 +68,7 @@ impl<DR: DnsResolver + Send + Sync> TcpDialer for SystemDialer<DR> {
 }
 
 impl<DR: DnsResolver + Send + Sync> UdpDialer for SystemDialer<DR> {
-    async fn bind_udp(&self, dest: &Destination) -> io::Result<UdpSocket> {
+    async fn bind_udp(&self, _dest: &Destination) -> io::Result<UdpSocket> {
         UdpSocket::bind(("0.0.0.0", 0)).await
     }
 }

@@ -1,3 +1,4 @@
+use crate::rcu_helper::RcuCell;
 use compact_str::CompactString;
 use parking_lot::lock_api::RwLockReadGuard;
 use parking_lot::{RawRwLock, RwLock};
@@ -27,10 +28,10 @@ pub struct UserListInner<P> {
 }
 
 #[derive(Debug)]
-pub struct UserList<P>(RwLock<Arc<UserListInner<P>>>);
+pub struct UserList<P>(RcuCell<UserListInner<P>>);
 
 impl<P> UserList<P> {
-    fn build_inner(user_array: impl IntoIterator<Item = User<P>>) -> Arc<UserListInner<P>> {
+    fn build_inner(user_array: impl IntoIterator<Item = User<P>>) -> UserListInner<P> {
         let user_array: Vec<_> = user_array
             .into_iter()
             .map(|user| (user, ByteCounter::default()))
@@ -42,24 +43,23 @@ impl<P> UserList<P> {
             .map(|(i, (user, _))| (user.authorization.clone(), i))
             .collect();
 
-        Arc::new(UserListInner {
+        UserListInner {
             user_array,
             authorization_index,
-        })
+        }
     }
     pub fn new(user_array: impl IntoIterator<Item = User<P>>) -> Self {
-        Self(RwLock::new(Self::build_inner(user_array)))
+        Self(RcuCell::new(Self::build_inner(user_array)))
     }
     pub fn new_with_arc(inner: Arc<UserListInner<P>>) -> Self {
-        Self(RwLock::new(inner))
+        Self(RcuCell::from_arc(inner))
     }
     pub fn read(&self) -> RwLockReadGuard<'_, RawRwLock, Arc<UserListInner<P>>> {
         self.0.read()
     }
     pub fn update(&self, new: impl IntoIterator<Item = User<P>>) {
         let new_inner = Self::build_inner(new);
-        let mut guard = self.0.write();
-        *guard = new_inner;
+        self.0.update(new_inner);
     }
 }
 

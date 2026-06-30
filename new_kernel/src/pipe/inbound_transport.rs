@@ -1,4 +1,4 @@
-use parking_lot::{RwLock, RwLockReadGuard};
+use crate::rcu_helper::RcuCell;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, mpsc};
@@ -111,7 +111,7 @@ pub trait InboundTransport<T: AsyncRead + AsyncWrite + Unpin + Send> {
     ) -> impl Future<Output = std::io::Result<Accepted<Self::StreamTy>>> + Send;
 }
 
-pub struct InboundList<T: InboundTransport<Str>, Str>(RwLock<Arc<[T]>>, PhantomData<fn(Str)>)
+pub struct InboundList<T: InboundTransport<Str>, Str>(RcuCell<[T]>, PhantomData<fn(Str)>)
 where
     Str: AsyncRead + AsyncWrite + Unpin + Send;
 
@@ -121,16 +121,19 @@ where
     Str: AsyncRead + AsyncWrite + Unpin + Send,
 {
     pub fn new(inner: impl IntoIterator<Item = T>) -> Self {
-        Self(RwLock::new(inner.into_iter().collect()), PhantomData)
+        Self(
+            RcuCell::from_arc(inner.into_iter().collect::<Arc<[T]>>()),
+            PhantomData,
+        )
     }
     pub fn new_with_arc(inner: Arc<[T]>) -> Self {
-        Self(RwLock::new(inner), PhantomData)
+        Self(RcuCell::from_arc(inner), PhantomData)
     }
-    pub fn read(&self) -> RwLockReadGuard<'_, Arc<[T]>> {
-        self.0.read()
+    pub fn read(&self) -> Arc<[T]> {
+        self.0.read_owned()
     }
     pub fn update(&self, new: impl IntoIterator<Item = T>) {
-        *self.0.write() = new.into_iter().collect();
+        self.0.swap_arc(new.into_iter().collect::<Arc<[T]>>());
     }
 }
 
