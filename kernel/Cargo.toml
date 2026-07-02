@@ -6,9 +6,11 @@ license.workspace = true
 
 [dependencies]
 tokio.workspace = true
-smallvec.workspace = true
+tokio-stream.workspace = true
 tokio-util.workspace = true
+tower.workspace = true
 futures.workspace = true
+smallvec.workspace = true
 bytes.workspace = true
 compact_str.workspace = true
 arc-swap.workspace = true
@@ -28,5 +30,5 @@ hickory-resolver.workspace = true
 socket2.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 hex.workspace = true

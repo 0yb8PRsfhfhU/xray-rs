@@ -1,8 +1,8 @@
 //! Ported from `Xray-core/common/protocol/address_test.go` and `uuid_test.go`.
 
 use bytes::Bytes;
-use kernel::types::net::{AddrCodec, Address};
-use kernel::types::uuid::Uuid;
+use kernel::net::{AddrCodec, Address};
+use kernel::uuid::Uuid;
 
 fn rd(codec: AddrCodec, input: &[u8]) -> kernel::Result<(Address, u16)> {
     let mut b = Bytes::copy_from_slice(input);

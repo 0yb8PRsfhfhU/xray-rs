@@ -9,8 +9,8 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::pipe_asm::pipe::Link;
-use crate::pipe_asm::timer::Timer;
+use crate::pipe::pipe::Link;
+use crate::pipe::timer::Timer;
 use crate::stats::Counter;
 
 /// Read window size handed to a single `read` (SPEC §2a, 8–64 KiB band).
@@ -181,7 +181,7 @@ where
 )]
 mod tests {
     use super::*;
-    use crate::pipe_asm::pipe::pipe;
+    use crate::pipe::pipe::pipe;
     use std::time::Duration;
 
     /// Test sink: forwards each event over an unbounded channel so the test can

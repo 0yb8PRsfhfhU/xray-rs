@@ -12,16 +12,18 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub struct Ctx {
     /// Monotonic session id (for logging/correlation).
     pub id: u64,
-    /// Tag of the inbound that accepted this connection.
+    /// Tag of the inbound (transport) that accepted this connection.
     pub inbound_tag: CompactString,
     /// Client source address.
     pub source: Option<SocketAddr>,
     /// Local address the connection landed on.
     pub local: Option<SocketAddr>,
-    /// Authenticated user tag (`{inbound_tag}|{email}|{uid}`), set by the
-    /// handler after auth so the relay can attribute traffic. `None` outside
-    /// the panel integration.
+    /// Authenticated user tag (`{inbound_tag}|{email}|{uid}`), set by the proxy
+    /// after auth so the relay/router can attribute traffic. `None` until auth.
     pub user_email: Option<CompactString>,
+    /// Stable authorization hash of the authenticated user, when known — feeds
+    /// the `user_auth_hash` load-balancer (objective requirement 5).
+    pub user_auth_hash: Option<u64>,
 }
 
 impl Ctx {
@@ -32,6 +34,7 @@ impl Ctx {
             source,
             local: None,
             user_email: None,
+            user_auth_hash: None,
         }
     }
 
@@ -40,11 +43,12 @@ impl Ctx {
         self.user_email.as_deref()
     }
 
-    /// Clone the context with `user_email` set, attributing the session to an
-    /// authenticated user after the handler decodes its header (SPEC §2f).
-    pub fn with_user(&self, email: impl Into<CompactString>) -> Ctx {
+    /// Clone the context with the authenticated user's email + auth hash set,
+    /// attributing the session after the proxy decodes its header (SPEC §2f).
+    pub fn with_user(&self, email: impl Into<CompactString>, auth_hash: u64) -> Ctx {
         Ctx {
             user_email: Some(email.into()),
+            user_auth_hash: Some(auth_hash),
             ..self.clone()
         }
     }

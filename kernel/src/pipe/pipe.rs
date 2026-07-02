@@ -1,12 +1,12 @@
 //! In-process duplex pipe (`Link`) — the data-plane spine (SPEC §2a).
 //!
 //! A bounded `mpsc<Bytes>` pair *is* the backpressure. Dropping a sender yields
-//! a clean EOF on the paired receiver; a [`CancellationToken`] aborts both ends.
+//! a clean EOF on the paired receiver; a [`CancellationToken`](tokio_util::sync::CancellationToken) aborts both ends.
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::types::net::Destination;
+use crate::net::Destination;
 
 /// Default number of in-flight chunks per direction (~backpressure window).
 pub const LINK_CAPACITY: usize = 32;

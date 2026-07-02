@@ -1,4 +1,4 @@
-//! Shared error type for the data plane and codecs.
+//! Shared error type for the data plane, codecs, and config build.
 
 use std::io;
 
@@ -46,6 +46,11 @@ pub enum Error {
     /// A wrapped I/O error from the transport.
     #[error(transparent)]
     Io(#[from] io::Error),
+
+    /// Tried to build or drive a service node that should not exist (e.g. a
+    /// child slot polled while the tree is mid-swap in a way that cannot recover).
+    #[error("service stack error")]
+    ServiceStack,
 }
 
 impl From<Error> for io::Error {

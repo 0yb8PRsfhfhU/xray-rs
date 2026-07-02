@@ -4,7 +4,7 @@ use std::fmt;
 
 use sha1::{Digest, Sha1};
 
-use crate::types::error::{Error, Result};
+use crate::error::{Error, Result};
 
 /// A 128-bit UUID used by VLESS / VMess user identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

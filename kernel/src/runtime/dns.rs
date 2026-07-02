@@ -1,4 +1,5 @@
-//! Shared DNS resolver with a `moka` cache (SPEC §P4).
+//! DNS resolution: an abstract [`DnsResolver`] trait (objective requirement 1)
+//! plus a shared, `moka`-cached concrete resolver (SPEC §P4).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -7,6 +8,15 @@ use std::time::Duration;
 use compact_str::CompactString;
 use hickory_resolver::TokioResolver;
 use moka::future::Cache;
+
+/// Abstract name resolver. The dialer and any router consume this by generic
+/// bound, never as a trait object (SPEC §P1), so downstream code can swap in a
+/// mock, a static hosts map, or a DNS-over-proxy client without touching the
+/// data plane.
+pub trait DnsResolver: Send + Sync {
+    /// Resolve a hostname to one or more IPs. IP literals short-circuit.
+    fn resolve(&self, host: &str) -> impl Future<Output = std::io::Result<Arc<[IpAddr]>>> + Send;
+}
 
 /// Resolver backed by `hickory-resolver` with a bounded, TTL'd `moka` cache in
 /// front to dedupe and bound the slow path.
@@ -30,9 +40,10 @@ impl CachedResolver {
             .build();
         CachedResolver { inner, cache }
     }
+}
 
-    /// Resolve a hostname to one or more IPs. IP literals short-circuit.
-    pub async fn resolve(&self, host: &str) -> std::io::Result<Arc<[IpAddr]>> {
+impl DnsResolver for CachedResolver {
+    async fn resolve(&self, host: &str) -> std::io::Result<Arc<[IpAddr]>> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(Arc::from(vec![ip]));
         }
