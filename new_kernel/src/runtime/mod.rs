@@ -1,6 +1,5 @@
 pub mod dialer;
 pub mod dns;
-pub mod service_stack;
 pub mod user;
 
 use crate::Error;
