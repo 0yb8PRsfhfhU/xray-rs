@@ -10,7 +10,7 @@ use md5::Md5;
 use sha1::Sha1;
 use sha2::Digest;
 
-use kernel::types::error::{Error, Result};
+use kernel::error::{Error, Result};
 
 /// Supported AEAD ciphers (Shadowsocks + VMess body).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

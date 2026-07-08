@@ -16,7 +16,9 @@ use compact_str::CompactString;
 
 use kernel::Uuid;
 use proxy::shadowsocks::method_kind;
-use proxy::{Inbound, Shadowsocks, Trojan, TrojanUsers, Vless, VlessUsers, Vmess, VmessUsers};
+use proxy::{
+    Inbound, ProxyContext, Shadowsocks, Trojan, TrojanUsers, Vless, VlessUsers, Vmess, VmessUsers,
+};
 use transport::{
     GrpcConfig, HttpUpgradeConfig, Security, StreamConfig, TlsServer, TransportKind, WsConfig,
 };
@@ -107,6 +109,7 @@ pub fn build_inbound_handler(
     node: &NodeInfo,
     users: &[UserInfo],
     node_tag: &str,
+    cx: &ProxyContext,
 ) -> Result<Inbound> {
     match node.node_type {
         NodeType::V2ray | NodeType::Vmess | NodeType::Vless => {
@@ -117,18 +120,21 @@ pub fn build_inbound_handler(
                         node.vless_flow
                     );
                 }
-                Ok(Inbound::Vless(Vless::new(Arc::new(build_vless_users(
-                    users, node_tag,
-                )))))
+                Ok(Inbound::Vless(Vless::new(
+                    Arc::new(build_vless_users(users, node_tag)),
+                    cx.clone(),
+                )))
             } else {
-                Ok(Inbound::Vmess(Vmess::new(Arc::new(build_vmess_users(
-                    users, node_tag,
-                )?))))
+                Ok(Inbound::Vmess(Vmess::new(
+                    Arc::new(build_vmess_users(users, node_tag)?),
+                    cx.clone(),
+                )))
             }
         }
-        NodeType::Trojan => Ok(Inbound::Trojan(Trojan::new(Arc::new(build_trojan_users(
-            users, node_tag,
-        ))))),
+        NodeType::Trojan => Ok(Inbound::Trojan(Trojan::new(
+            Arc::new(build_trojan_users(users, node_tag)),
+            cx.clone(),
+        ))),
         NodeType::Shadowsocks => {
             let method = ss_method(node, users)
                 .ok_or_else(|| anyhow!("shadowsocks node has no cipher method and no users"))?;
@@ -138,6 +144,7 @@ pub fn build_inbound_handler(
             Ok(Inbound::Shadowsocks(Shadowsocks::new(
                 kind,
                 build_ss_user_iter(users, node_tag),
+                cx.clone(),
             )))
         }
         NodeType::ShadowsocksPlugin => {
@@ -232,6 +239,7 @@ pub fn build_inbound(
     users: &[UserInfo],
     listen_ip: &str,
     cert: &CertConfig,
+    cx: &ProxyContext,
 ) -> Result<BuiltInbound> {
     let port: u16 = node
         .port
@@ -241,7 +249,7 @@ pub fn build_inbound(
         bail!("node port must be > 0");
     }
     let tag = build_node_tag(node, listen_ip);
-    let handler = build_inbound_handler(node, users, &tag)?;
+    let handler = build_inbound_handler(node, users, &tag, cx)?;
     let stream = build_stream(node, cert)?;
     Ok(BuiltInbound {
         tag,
@@ -311,6 +319,12 @@ mod tests {
         }
     }
 
+    fn test_cx() -> ProxyContext {
+        let resolver = Arc::new(kernel::CachedResolver::system().expect("resolver"));
+        let dialer = Arc::new(kernel::SystemDialer::new(resolver));
+        ProxyContext::new(dialer, None, kernel::ConnectionPolicy::default())
+    }
+
     #[test]
     fn node_and_user_tags() {
         let n = node(NodeType::V2ray);
@@ -325,16 +339,17 @@ mod tests {
 
     #[test]
     fn v2ray_builds_vmess_by_default_and_vless_when_enabled() {
+        let cx = test_cx();
         let users = vec![user(1, UUID, "", "")];
         let n = node(NodeType::V2ray);
         assert!(matches!(
-            build_inbound_handler(&n, &users, "t").unwrap(),
+            build_inbound_handler(&n, &users, "t", &cx).unwrap(),
             Inbound::Vmess(_)
         ));
         let mut nv = node(NodeType::V2ray);
         nv.enable_vless = true;
         assert!(matches!(
-            build_inbound_handler(&nv, &users, "t").unwrap(),
+            build_inbound_handler(&nv, &users, "t", &cx).unwrap(),
             Inbound::Vless(_)
         ));
     }
@@ -344,20 +359,21 @@ mod tests {
         let users = vec![user(1, UUID, "", "")];
         let mut n = node(NodeType::Vless);
         n.vless_flow = CompactString::from("xtls-rprx-vision");
-        assert!(build_inbound_handler(&n, &users, "t").is_err());
+        assert!(build_inbound_handler(&n, &users, "t", &test_cx()).is_err());
     }
 
     #[test]
     fn trojan_and_shadowsocks_build() {
+        let cx = test_cx();
         let users = vec![user(1, UUID, "secret", "aes-128-gcm")];
         assert!(matches!(
-            build_inbound_handler(&node(NodeType::Trojan), &users, "t").unwrap(),
+            build_inbound_handler(&node(NodeType::Trojan), &users, "t", &cx).unwrap(),
             Inbound::Trojan(_)
         ));
         let mut ss = node(NodeType::Shadowsocks);
         ss.cypher_method = CompactString::from("aes-128-gcm");
         assert!(matches!(
-            build_inbound_handler(&ss, &users, "t").unwrap(),
+            build_inbound_handler(&ss, &users, "t", &cx).unwrap(),
             Inbound::Shadowsocks(_)
         ));
     }
@@ -367,15 +383,18 @@ mod tests {
         // Old SSPanel SS API leaves node method empty; fall back to the user's.
         let users = vec![user(1, UUID, "pw", "chacha20-ietf-poly1305")];
         let ss = node(NodeType::Shadowsocks);
-        assert!(build_inbound_handler(&ss, &users, "t").is_ok());
+        assert!(build_inbound_handler(&ss, &users, "t", &test_cx()).is_ok());
     }
 
     #[test]
     fn ss2022_and_plugin_are_rejected() {
+        let cx = test_cx();
         let users = vec![user(1, UUID, "pw", "2022-blake3-aes-128-gcm")];
         let ss = node(NodeType::Shadowsocks);
-        assert!(build_inbound_handler(&ss, &users, "t").is_err());
-        assert!(build_inbound_handler(&node(NodeType::ShadowsocksPlugin), &users, "t").is_err());
+        assert!(build_inbound_handler(&ss, &users, "t", &cx).is_err());
+        assert!(
+            build_inbound_handler(&node(NodeType::ShadowsocksPlugin), &users, "t", &cx).is_err()
+        );
     }
 
     #[test]
@@ -439,7 +458,7 @@ mod tests {
     fn apply_users_swaps_matching_handler() {
         let users = vec![user(1, UUID, "", "")];
         let n = node(NodeType::V2ray);
-        let handler = build_inbound_handler(&n, &users, "t").unwrap();
+        let handler = build_inbound_handler(&n, &users, "t", &test_cx()).unwrap();
         let more = vec![user(1, UUID, "", ""), user(2, UUID, "", "")];
         assert!(apply_users(&handler, &n, &more, "t").is_ok());
     }

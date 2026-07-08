@@ -17,6 +17,7 @@ kernel.workspace = true
 proxy.workspace = true
 transport.workspace = true
 tokio.workspace = true
+tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true

@@ -3,19 +3,29 @@
 //! VLESS hands its post-header stream directly; the byte stream carries frames
 //! `[metalen(2)][meta][datalen(2)][data?]`.
 //!
-//! The XUDP global-ID connection-migration optimisation is intentionally not
-//! implemented; every `New` UDP sub-session dispatches a fresh relay, which is
-//! functionally correct for normal clients.
+//! The kernel tower tree cannot express one carrier fanning out to many
+//! independently-routed sub-flows, so each mux sub-session is self-serviced here
+//! through the shared direct dialer: TCP sub-sessions dial + relay, UDP
+//! sub-sessions bind a direct socket. Sub-flow egress is therefore always direct
+//! (freedom), not routed. The XUDP global-ID migration optimisation is not
+//! implemented; every `New` UDP sub-session gets a fresh relay.
 
 use std::collections::HashMap;
 use std::io;
 
 use bytes::{Bytes, BytesMut};
-use kernel::types::net::AddrCodec;
-use kernel::{Ctx, Destination, Dispatcher, Network, Policy, Timer, UdpLink, UdpPacket};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use kernel::net::AddrCodec;
+use kernel::{
+    ConnectionPolicy, Destination, LINK_CAPACITY, Link, Network, TcpDialer, Timer, UdpLink,
+    UdpPacket, pipe, splice, udp_pipe,
+};
+
+use crate::SharedDialer;
+use crate::udp::freedom_udp;
 
 const ST_NEW: u8 = 0x01;
 const ST_KEEP: u8 = 0x02;
@@ -140,13 +150,13 @@ impl<R: AsyncRead + Unpin> Reader<R> {
     }
 }
 
-/// Demultiplex a mux.cool plaintext stream until it closes or idles.
+/// Demultiplex a mux.cool plaintext stream until it closes or idles. Each
+/// sub-session egresses DIRECT through `dialer` (the tree cannot route them).
 pub async fn serve<S>(
     io: S,
     leftover: Bytes,
-    ctx: &Ctx,
-    disp: &Dispatcher,
-    policy: &Policy,
+    dialer: SharedDialer,
+    policy: ConnectionPolicy,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -155,7 +165,7 @@ where
     let mut reader = Reader::new(rh, leftover);
     let token = CancellationToken::new();
     let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(64);
-    let timer = Timer::new(policy.idle);
+    let timer = Timer::new(policy.idle_timeout);
 
     // Single writer task serialises muxed frames back to the client.
     let writer = tokio::spawn(async move {
@@ -168,17 +178,7 @@ where
     });
 
     let mut sessions: HashMap<u16, Sub> = HashMap::new();
-    let result = demux(
-        &mut reader,
-        ctx,
-        disp,
-        policy,
-        &timer,
-        &token,
-        &out_tx,
-        &mut sessions,
-    )
-    .await;
+    let result = demux(&mut reader, &dialer, &timer, &token, &out_tx, &mut sessions).await;
 
     token.cancel();
     drop(out_tx);
@@ -187,12 +187,9 @@ where
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn demux<R>(
     reader: &mut Reader<R>,
-    ctx: &Ctx,
-    disp: &Dispatcher,
-    policy: &Policy,
+    dialer: &SharedDialer,
     timer: &Timer,
     token: &CancellationToken,
     out_tx: &mpsc::Sender<Bytes>,
@@ -229,10 +226,7 @@ where
         timer.update();
         match meta.status {
             ST_NEW => {
-                handle_new(
-                    ctx, disp, policy, timer, token, out_tx, sessions, &meta, data,
-                )
-                .await;
+                handle_new(dialer, timer, token, out_tx, sessions, &meta, data).await;
             }
             ST_KEEP => {
                 if let Some(d) = data {
@@ -248,11 +242,8 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_new(
-    ctx: &Ctx,
-    disp: &Dispatcher,
-    _policy: &Policy,
+    dialer: &SharedDialer,
     timer: &Timer,
     token: &CancellationToken,
     out_tx: &mpsc::Sender<Bytes>,
@@ -266,7 +257,14 @@ async fn handle_new(
     };
     let sid = meta.sid;
     if target.network == Network::Udp {
-        let UdpLink { mut reader, writer } = disp.dispatch_udp(ctx, timer.clone());
+        // Self-serviced UDP egress via a direct socket over its own link.
+        let (inbound, outbound) = udp_pipe(LINK_CAPACITY);
+        let eg_dialer = dialer.clone();
+        let eg_timer = timer.clone();
+        tokio::spawn(async move {
+            let _ = freedom_udp(eg_dialer, outbound, eg_timer).await;
+        });
+        let UdpLink { mut reader, writer } = inbound;
         if let Some(d) = data {
             let _ = writer
                 .send(UdpPacket {
@@ -296,8 +294,19 @@ async fn handle_new(
             let _ = out.send(frame_end(sid)).await;
         });
     } else {
-        let link = disp.dispatch_tcp(ctx, target, timer.clone());
-        let kernel::Link { mut reader, writer } = link;
+        // Self-serviced TCP egress: dial the target and splice its outbound half.
+        let (inbound, outbound) = pipe(LINK_CAPACITY);
+        let eg_dialer = dialer.clone();
+        let eg_timer = timer.clone();
+        tokio::spawn(async move {
+            match eg_dialer.dial_tcp(&target).await {
+                Ok(stream) => {
+                    let _ = splice(stream, outbound, &eg_timer).await;
+                }
+                Err(_) => drop(outbound),
+            }
+        });
+        let Link { mut reader, writer } = inbound;
         if let Some(d) = data
             && !d.is_empty()
         {

@@ -8,8 +8,8 @@ use aes::Aes128;
 use aes::cipher::BlockCipherDecrypt;
 use compact_str::CompactString;
 
+use kernel::Error;
 use kernel::Uuid;
-use kernel::types::error::Error;
 
 use super::crypto::{SALT_AUTHID, cmd_key, kdf16};
 

@@ -9,6 +9,9 @@ use shake::digest::{ExtendableOutput, Update as _, XofReader};
 use shake::{Shake128, Shake128Reader};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use kernel::ConnectionPolicy;
+
+use crate::SharedDialer;
 use crate::crypto::{Aead, AeadKind};
 use crate::io::{ChunkRead, ChunkWrite};
 
@@ -230,6 +233,57 @@ impl ChunkWrite for Body {
     {
         write_terminal(w, self).await
     }
+}
+
+/// Bridge the AEAD chunk body to a plaintext duplex and run the mux demuxer
+/// (XUDP / mux.cool) over it, aborting the bridge when the session ends. VMess
+/// mux rides inside the encrypted body, so the codecs decrypt/encrypt one side
+/// of a `tokio::io::duplex` and hand the plaintext other side to `mux::serve`;
+/// each sub-flow egresses DIRECT through `dialer` (the tower tree cannot route
+/// one carrier fanning out to many sub-sessions).
+pub(crate) async fn serve_mux<S>(
+    conn: S,
+    mut up: Body,
+    mut down: Body,
+    dialer: SharedDialer,
+    policy: ConnectionPolicy,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mine, theirs) = tokio::io::duplex(65536);
+    let (mut r, mut w) = tokio::io::split(conn);
+    let (mut mr, mut mw) = tokio::io::split(mine);
+    let bridge = tokio::spawn(async move {
+        let up_dir = async move {
+            while let Ok(Some(c)) = read_chunk(&mut r, &mut up).await {
+                if !c.is_empty() && mw.write_all(&c).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let down_dir = async move {
+            let mut buf = vec![0u8; 16384];
+            loop {
+                match mr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if write_chunk(&mut w, &mut down, buf.get(..n).unwrap_or(&[]))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = write_terminal(&mut w, &mut down).await;
+        };
+        tokio::join!(up_dir, down_dir);
+    });
+    let res = crate::mux::serve(theirs, Bytes::new(), dialer, policy).await;
+    bridge.abort();
+    res
 }
 
 #[cfg(test)]

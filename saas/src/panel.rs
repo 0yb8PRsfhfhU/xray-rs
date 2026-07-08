@@ -6,7 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use kernel::{CachedResolver, Dispatcher, Policy, Stats, SystemDialer};
+use kernel::{
+    CachedResolver, ConnectionPolicy, NoGeo, OutboundDispatch, OutboundList, RouteService, Stats,
+    SystemDialer,
+};
+use proxy::ProxyContext;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
@@ -18,27 +22,30 @@ use crate::sspanel::SspanelClient;
 /// Build the data plane and run every configured SSPanel node until `shutdown`.
 pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
     // Shared per-user traffic stats, read by controllers and written by the
-    // data plane via the dispatcher.
+    // data plane's copy loops via per-user counters resolved at connection setup.
     let stats = Arc::new(Stats::new());
 
     let resolver = Arc::new(CachedResolver::system().context("DNS resolver")?);
-    let dialer = SystemDialer::new(resolver);
+    let dialer = Arc::new(SystemDialer::new(resolver));
     let egress = egress_compile::compile(&config.egress).context("egress routing")?;
-    let dispatcher = Arc::new(
-        Dispatcher::new(dialer, egress.outbounds, egress.default_tag, egress.router)
-            .with_stats(stats.clone()),
-    );
 
-    let policy = Policy {
-        handshake: Duration::from_secs(u64::from(config.connection.handshake.max(1))),
-        idle: Duration::from_secs(u64::from(config.connection.conn_idle.max(1))),
+    // Shared tower children: the route table + the tag-keyed outbound dispatch
+    // (freedom default), built once and cloned into every node's inbound tree.
+    let outbounds = Arc::new(OutboundList::new(egress.outbounds));
+    let route_svc = RouteService::new(Arc::new(egress.route_table), Arc::new(NoGeo));
+    let ob_dispatch = OutboundDispatch::new(outbounds, dialer.clone(), egress.freedom_tag);
+
+    let policy = ConnectionPolicy {
+        handshake_timeout: Duration::from_secs(u64::from(config.connection.handshake.max(1))),
+        idle_timeout: Duration::from_secs(u64::from(config.connection.conn_idle.max(1))),
     };
     tracing::debug!(
-        handshake_secs = policy.handshake.as_secs(),
-        idle_secs = policy.idle.as_secs(),
+        handshake_secs = policy.handshake_timeout.as_secs(),
+        idle_secs = policy.idle_timeout.as_secs(),
         "data plane policy configured"
     );
-    let ibm = Arc::new(InboundManager::new(dispatcher, policy));
+    let cx = ProxyContext::new(dialer, Some(stats.clone()), policy);
+    let ibm = Arc::new(InboundManager::new(route_svc, ob_dispatch));
 
     let mut controllers = Vec::new();
     for node in &config.nodes {
@@ -57,8 +64,13 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
             "starting SSpanel controller"
         );
         let client = SspanelClient::new(&api_cfg);
-        let mut controller =
-            Controller::new(client, node.controller.clone(), ibm.clone(), stats.clone());
+        let mut controller = Controller::new(
+            client,
+            node.controller.clone(),
+            ibm.clone(),
+            stats.clone(),
+            cx.clone(),
+        );
         controller
             .start()
             .await

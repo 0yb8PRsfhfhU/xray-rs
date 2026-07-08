@@ -18,7 +18,11 @@ use saas::inbound_manager::InboundManager;
 use saas::sspanel::SspanelClient;
 
 use compact_str::CompactString;
-use kernel::{CachedResolver, Dispatcher, Outbound, Policy, Stats, SystemDialer};
+use kernel::{
+    CachedResolver, ConnectionPolicy, NoGeo, OutboundDispatch, OutboundList, RouteService,
+    RouteTable, Stats, SystemDialer,
+};
+use proxy::{Outbound, ProxyContext};
 
 const NODE_ID: i32 = 3;
 const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
@@ -246,29 +250,33 @@ async fn sspanel_client_endpoints_round_trip() {
     );
 }
 
-fn build_dispatcher(stats: Arc<Stats>) -> Arc<Dispatcher> {
-    let resolver = Arc::new(CachedResolver::system().expect("resolver"));
-    let dialer = SystemDialer::new(resolver);
-    let mut outbounds = std::collections::HashMap::new();
-    outbounds.insert(CompactString::new("freedom"), Outbound::Freedom);
-    Arc::new(Dispatcher::new(dialer, outbounds, "freedom", None).with_stats(stats))
-}
-
 #[tokio::test]
 async fn controller_binds_inbound_and_reports_counted_traffic() {
     let port = free_port();
     let (host, state) = start_mock(port).await;
 
     let stats = Arc::new(Stats::new());
-    let dispatcher = build_dispatcher(stats.clone());
-    let ibm = Arc::new(InboundManager::new(dispatcher, Policy::default()));
+    let resolver = Arc::new(CachedResolver::system().expect("resolver"));
+    let dialer = Arc::new(SystemDialer::new(resolver));
+    let outbounds = Arc::new(OutboundList::new([(
+        CompactString::new("freedom"),
+        Outbound::Freedom,
+    )]));
+    let route_svc = RouteService::new(Arc::new(RouteTable::new(Vec::new(), None)), Arc::new(NoGeo));
+    let ob_dispatch = OutboundDispatch::new(
+        outbounds,
+        dialer.clone(),
+        Some(CompactString::new("freedom")),
+    );
+    let cx = ProxyContext::new(dialer, Some(stats.clone()), ConnectionPolicy::default());
+    let ibm = Arc::new(InboundManager::new(route_svc, ob_dispatch));
 
     let cfg = ControllerConfig {
         listen_ip: "127.0.0.1".to_string(),
         ..Default::default()
     };
     let client = SspanelClient::new(&api_config(&host));
-    let mut controller = Controller::new(client, cfg, ibm.clone(), stats.clone());
+    let mut controller = Controller::new(client, cfg, ibm.clone(), stats.clone(), cx);
 
     // Start: fetch node + users, build and bind the inbound.
     controller.start().await.expect("controller start");

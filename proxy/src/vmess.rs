@@ -17,12 +17,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
-use kernel::{Ctx, Dispatcher, Network, Policy, Timer};
-use transport::Stream;
+use kernel::{Ctx, LINK_CAPACITY, Network, Proxy, ProxyDecision, Timer, pipe};
 
-use crate::ProxyInbound;
+use crate::ProxyContext;
 use crate::crypto::{Aead, AeadKind};
-use crate::io::{relay_framed, user_counter};
+use crate::io::{noop_decision, relay_framed, user_counter, user_hash};
 
 mod crypto;
 
@@ -34,6 +33,8 @@ const OPT_GLOBAL_PADDING: u8 = 0x08;
 const SEC_AES128_GCM: u8 = 3;
 const SEC_CHACHA20: u8 = 4;
 const SEC_NONE: u8 = 5;
+
+const NETWORKS: &[Network] = &[Network::Tcp];
 
 const VMESS_ACTIVE_AUTH_MAX: usize = 1024;
 const VMESS_AUTH_REPLAY_WINDOW_SECS: u64 = 120;
@@ -113,10 +114,11 @@ pub struct Vmess {
     auth_active_hits: AtomicU64,
     auth_fallback_hits: AtomicU64,
     auth_failures: AtomicU64,
+    cx: ProxyContext,
 }
 
 impl Vmess {
-    pub fn new(users: Arc<VmessUsers>) -> Vmess {
+    pub fn new(users: Arc<VmessUsers>, cx: ProxyContext) -> Vmess {
         Vmess {
             users: arc_swap::ArcSwap::from(users),
             active_users: Arc::new(Mutex::new(VecDeque::new())),
@@ -124,7 +126,12 @@ impl Vmess {
             auth_active_hits: AtomicU64::new(0),
             auth_fallback_hits: AtomicU64::new(0),
             auth_failures: AtomicU64::new(0),
+            cx,
         }
+    }
+
+    pub fn networks(&self) -> &'static [Network] {
+        NETWORKS
     }
 
     /// Swap in a new user table (live user sync, SPEC §P2).
@@ -183,41 +190,6 @@ impl Vmess {
             .lock()
             .map(|mut replay| replay.check_insert(authid, unix_now_secs()))
             .map_err(|_| io::Error::other("vmess replay filter poisoned"))
-    }
-
-    pub async fn process(
-        &self,
-        ctx: &Ctx,
-        mut conn: Stream,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> io::Result<()> {
-        let req = timeout(policy.handshake, self.read_header(ctx, &mut conn))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
-        let ctx = ctx.with_user(req.email.clone());
-        let ctx = &ctx;
-
-        let (resp_key, resp_iv) = response_keys(&req);
-        write_response_header(&mut conn, &resp_key, &resp_iv, req.resp_header).await?;
-        let (up, down) = body_codecs(&req, &resp_key, &resp_iv)?;
-
-        // Mux (XUDP / mux.cool) carries no address and is demuxed separately.
-        if req.mux {
-            return serve_mux(conn, up, down, ctx, disp, policy).await;
-        }
-
-        if req.dest.network == Network::Udp {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "vmess udp-direct not supported",
-            ));
-        }
-
-        let timer = Timer::new(policy.idle);
-        let counter = user_counter(ctx, disp).await;
-        let link = disp.dispatch_tcp(ctx, req.dest, timer.clone());
-        relay_framed(conn, up, down, link, timer, counter, Bytes::new()).await
     }
 
     async fn read_header<R>(&self, ctx: &Ctx, conn: &mut R) -> io::Result<Request>
@@ -291,15 +263,63 @@ impl Vmess {
     }
 }
 
-impl ProxyInbound for Vmess {
-    async fn serve(
-        &self,
-        ctx: &Ctx,
-        conn: Stream,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> io::Result<()> {
-        Vmess::process(self, ctx, conn, disp, policy).await
+impl Proxy for Vmess {
+    type Auth = ();
+
+    fn networks(&self) -> &[Network] {
+        NETWORKS
+    }
+
+    async fn decode<S>(&self, ctx: Ctx, mut stream: S) -> io::Result<ProxyDecision>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let req = timeout(
+            self.cx.policy.handshake_timeout,
+            self.read_header(&ctx, &mut stream),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
+        let email = req.email.clone();
+        let hash = user_hash(email.as_bytes());
+        let ctx = ctx.with_user(email, hash);
+
+        let (resp_key, resp_iv) = response_keys(&req);
+        write_response_header(&mut stream, &resp_key, &resp_iv, req.resp_header).await?;
+        let (up, down) = body_codecs(&req, &resp_key, &resp_iv)?;
+
+        // Mux (XUDP / mux.cool) carries no address and is demuxed separately;
+        // decode services it to completion, then no-ops the tower tree.
+        if req.mux {
+            serve_mux(stream, up, down, self.cx.dialer.clone(), self.cx.policy).await?;
+            return Ok(noop_decision(ctx));
+        }
+
+        // VMess has no UDP-over-stream mode; reject a UDP command outright.
+        if req.dest.network == Network::Udp {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "vmess udp-direct not supported",
+            ));
+        }
+
+        let timer = Timer::new(self.cx.policy.idle_timeout);
+        let counter = user_counter(&ctx, self.cx.stats.as_ref()).await;
+        let (inbound, outbound) = pipe(LINK_CAPACITY);
+        tokio::spawn(relay_framed(
+            stream,
+            up,
+            down,
+            inbound,
+            timer,
+            counter,
+            Bytes::new(),
+        ));
+        Ok(ProxyDecision {
+            target: req.dest,
+            ctx,
+            link: outbound,
+        })
     }
 }
 
@@ -362,51 +382,6 @@ fn body_codecs(req: &Request, resp_key: &[u8; 16], resp_iv: &[u8; 16]) -> io::Re
     Ok((up, down))
 }
 
-/// Bridge the AEAD chunk body to a plaintext duplex and run the mux demuxer
-/// (XUDP / mux.cool) over it, aborting the bridge when the session ends.
-async fn serve_mux(
-    conn: Stream,
-    mut up: Body,
-    mut down: Body,
-    ctx: &Ctx,
-    disp: &Dispatcher,
-    policy: &Policy,
-) -> io::Result<()> {
-    let (mine, theirs) = tokio::io::duplex(65536);
-    let (mut r, mut w) = tokio::io::split(conn);
-    let (mut mr, mut mw) = tokio::io::split(mine);
-    let bridge = tokio::spawn(async move {
-        let up_dir = async move {
-            while let Ok(Some(c)) = read_chunk(&mut r, &mut up).await {
-                if !c.is_empty() && mw.write_all(&c).await.is_err() {
-                    break;
-                }
-            }
-        };
-        let down_dir = async move {
-            let mut buf = vec![0u8; 16384];
-            loop {
-                match mr.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if write_chunk(&mut w, &mut down, buf.get(..n).unwrap_or(&[]))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-            let _ = write_terminal(&mut w, &mut down).await;
-        };
-        tokio::join!(up_dir, down_dir);
-    });
-    let res = crate::mux::serve(theirs, bytes::Bytes::new(), ctx, disp, policy).await;
-    bridge.abort();
-    res
-}
-
 fn body_aead(security: u8, key: &[u8; 16]) -> io::Result<Option<Aead>> {
     let mk = |kind, k: &[u8]| Aead::new(kind, k).map_err(io::Error::other);
     match security {
@@ -432,18 +407,28 @@ mod tests {
     use super::*;
     use compact_str::CompactString;
     use kernel::Uuid;
+    use kernel::{CachedResolver, ConnectionPolicy, SystemDialer};
 
     fn uuid(text: &str) -> Uuid {
         Uuid::parse_str(text).expect("uuid")
     }
 
-    #[test]
-    fn vmess_set_users_clears_active_auth_hotset() {
+    fn test_cx() -> ProxyContext {
+        let resolver = Arc::new(CachedResolver::system().expect("resolver"));
+        let dialer = Arc::new(SystemDialer::new(resolver));
+        ProxyContext::new(dialer, None, ConnectionPolicy::default())
+    }
+
+    #[tokio::test]
+    async fn vmess_set_users_clears_active_auth_hotset() {
         let a = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
         let b = uuid("7cd0a7b7-7b3a-4d61-ae0b-5f0f77f2f04f");
-        let handler = Vmess::new(Arc::new(
-            VmessUsers::new([(a, CompactString::new("a@example.test"), 0)]).expect("users"),
-        ));
+        let handler = Vmess::new(
+            Arc::new(
+                VmessUsers::new([(a, CompactString::new("a@example.test"), 0)]).expect("users"),
+            ),
+            test_cx(),
+        );
         handler
             .active_users
             .lock()
@@ -478,12 +463,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn vmess_auth_stats_record_active_and_fallback_hits() {
+    #[tokio::test]
+    async fn vmess_auth_stats_record_active_and_fallback_hits() {
         let id = uuid("b831381d-6324-4d53-ad4f-8cda48b30811");
-        let handler = Vmess::new(Arc::new(
-            VmessUsers::new([(id, CompactString::new("a@example.test"), 0)]).expect("users"),
-        ));
+        let handler = Vmess::new(
+            Arc::new(
+                VmessUsers::new([(id, CompactString::new("a@example.test"), 0)]).expect("users"),
+            ),
+            test_cx(),
+        );
 
         handler.record_auth_hit(VmessAuthKind::Active);
         handler.record_auth_hit(VmessAuthKind::Fallback);

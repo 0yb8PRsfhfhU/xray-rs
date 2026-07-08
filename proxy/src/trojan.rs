@@ -8,16 +8,18 @@ use std::sync::Arc;
 use bytes::Bytes;
 use compact_str::CompactString;
 use sha2::{Digest, Sha224};
+use tokio::io::{AsyncRead, AsyncWrite};
 
-use kernel::types::error::Error;
-use kernel::types::net::{self, AddrCodec};
-use kernel::{Ctx, Destination, Dispatcher, Network, Policy, Timer};
-use transport::Stream;
+use kernel::net::{self, AddrCodec};
+use kernel::{Ctx, Destination, Error, LINK_CAPACITY, Network, Proxy, ProxyDecision, Timer, pipe};
 
-use crate::ProxyInbound;
-use crate::io::{read_header, relay_tcp};
+use crate::ProxyContext;
+use crate::io::{
+    noop_decision, read_header, relay_stream, sniff_override, user_counter, user_hash,
+};
 
 const CMD_UDP: u8 = 3;
+const NETWORKS: &[Network] = &[Network::Tcp, Network::Udp];
 
 /// A trojan user (the 56-byte key derives from the password).
 #[derive(Debug)]
@@ -86,12 +88,14 @@ fn parse(buf: &mut Bytes, users: &TrojanUsers) -> Result<(Destination, CompactSt
 /// Trojan inbound handler.
 pub struct Trojan {
     users: arc_swap::ArcSwap<TrojanUsers>,
+    cx: ProxyContext,
 }
 
 impl Trojan {
-    pub fn new(users: Arc<TrojanUsers>) -> Trojan {
+    pub fn new(users: Arc<TrojanUsers>, cx: ProxyContext) -> Trojan {
         Trojan {
             users: arc_swap::ArcSwap::from(users),
+            cx,
         }
     }
 
@@ -99,29 +103,58 @@ impl Trojan {
     pub fn set_users(&self, users: Arc<TrojanUsers>) {
         self.users.store(users);
     }
+
+    pub fn networks(&self) -> &'static [Network] {
+        NETWORKS
+    }
 }
 
-impl ProxyInbound for Trojan {
-    async fn serve(
-        &self,
-        ctx: &Ctx,
-        mut conn: Stream,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> io::Result<()> {
+impl Proxy for Trojan {
+    type Auth = ();
+
+    fn networks(&self) -> &[Network] {
+        NETWORKS
+    }
+
+    async fn decode<S>(&self, ctx: Ctx, mut stream: S) -> io::Result<ProxyDecision>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let users = self.users.load_full();
-        let ((dest, email), leftover) = read_header(&mut conn, policy.handshake, 16384, move |b| {
-            parse(b, &users)
-        })
+        let ((dest, email), leftover) = read_header(
+            &mut stream,
+            self.cx.policy.handshake_timeout,
+            16384,
+            move |b| parse(b, &users),
+        )
         .await?;
-        let ctx = ctx.with_user(email);
-        let ctx = &ctx;
-        let timer = Timer::new(policy.idle);
+        let hash = user_hash(email.as_bytes());
+        let ctx = ctx.with_user(email, hash);
+        let timer = Timer::new(self.cx.policy.idle_timeout);
+        let counter = user_counter(&ctx, self.cx.stats.as_ref()).await;
         match dest.network {
             Network::Udp => {
-                crate::udp::relay_trojan_udp(conn, dest, leftover, ctx, disp, timer).await
+                crate::udp::relay_trojan_udp(
+                    stream,
+                    dest,
+                    leftover,
+                    self.cx.dialer.as_ref(),
+                    timer,
+                    counter,
+                )
+                .await?;
+                Ok(noop_decision(ctx))
             }
-            _ => relay_tcp(conn, dest, leftover, ctx, disp, timer).await,
+            _ => {
+                let target = sniff_override(dest, &leftover);
+                let (inbound, outbound) = pipe(LINK_CAPACITY);
+                tokio::spawn(relay_stream(stream, inbound, timer, counter, leftover));
+                Ok(ProxyDecision {
+                    target,
+                    ctx,
+                    link: outbound,
+                })
+            }
         }
     }
 }

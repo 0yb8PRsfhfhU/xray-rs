@@ -2,9 +2,12 @@
 //! can add a node's inbound at start and rebuild it when the node config
 //! changes — the xray-rs analogue of XrayR's `inbound.Manager` add/remove.
 //!
-//! Each inbound owns a [`CancellationToken`]; `remove` cancels it, which stops
-//! the accept loop and drops the listener. In-flight connections, already
-//! spawned, run to completion on their own.
+//! Each node's inbound is a per-node tower service tree (transport → proxy →
+//! shared route + outbound children). Live user changes never rebuild the tree:
+//! the handler's internal `ArcSwap` user table is swapped in place (see
+//! [`handler`](InboundManager::handler) + `builder::apply_users`). Each inbound
+//! owns a [`CancellationToken`]; `remove` cancels it, stopping the accept loop
+//! and dropping the listener. In-flight connections run to completion.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -12,14 +15,28 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use compact_str::CompactString;
-use kernel::{Ctx, Dispatcher, Policy};
+use kernel::{
+    CachedResolver, Ctx, Incoming, NoGeo, OutboundDispatch, ProxyService, RouteService,
+    SystemDialer, TransportService,
+};
 use parking_lot::{Mutex, MutexGuard};
-use proxy::{Inbound, ProxyInbound};
+use proxy::Inbound;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use transport::{Accepted, SocketOpts, accept_conn, bind_tcp};
+use tower::ServiceExt;
+use transport::{SocketOpts, StreamTransport, bind_tcp};
 
 use crate::builder::BuiltInbound;
+
+/// Concrete outbound sum (freedom / blackhole / ss / socks).
+type Ob = proxy::Outbound;
+type Dial = SystemDialer<CachedResolver>;
+/// Shared route child (first-match table over the configured egress).
+pub type RouteChild = RouteService<NoGeo>;
+/// Shared outbound-dispatch child (tag-keyed egress + freedom default).
+pub type ObChild = OutboundDispatch<Ob, Dial>;
+type ProxySvc = ProxyService<Inbound, RouteChild, ObChild>;
+type InboundTree = TransportService<StreamTransport, ProxySvc>;
 
 struct Running {
     token: CancellationToken,
@@ -27,18 +44,19 @@ struct Running {
     tasks: Vec<JoinHandle<()>>,
 }
 
-/// Owns the set of live inbound listeners, keyed by node tag.
+/// Owns the set of live inbound listeners, keyed by node tag. Every inbound
+/// shares the route + outbound children built once from the egress config.
 pub struct InboundManager {
-    disp: Arc<Dispatcher>,
-    policy: Policy,
+    route_svc: RouteChild,
+    ob_dispatch: ObChild,
     running: Mutex<HashMap<CompactString, Running>>,
 }
 
 impl InboundManager {
-    pub fn new(disp: Arc<Dispatcher>, policy: Policy) -> InboundManager {
+    pub fn new(route_svc: RouteChild, ob_dispatch: ObChild) -> InboundManager {
         InboundManager {
-            disp,
-            policy,
+            route_svc,
+            ob_dispatch,
             running: Mutex::new(HashMap::new()),
         }
     }
@@ -80,7 +98,7 @@ impl InboundManager {
         let token = CancellationToken::new();
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
-        // UDP listener (Shadowsocks).
+        // UDP listener (Shadowsocks) — bound alongside, driven outside the tree.
         if handler.binds_udp() {
             match std::net::UdpSocket::bind(addr).and_then(|s| {
                 s.set_nonblocking(true)?;
@@ -89,18 +107,14 @@ impl InboundManager {
                 Ok(sock) => {
                     let sock = Arc::new(sock);
                     let uh = handler.clone();
-                    let ud = self.disp.clone();
-                    let policy = self.policy;
                     let utag = tag.clone();
                     let utk = token.clone();
                     tracing::info!(tag = %utag, %addr, "listening (udp)");
                     tasks.push(tokio::spawn(async move {
-                        let ctx = Ctx::new(utag.clone(), None);
+                        let ctx = Ctx::new(utag, None);
                         tokio::select! {
-                            _ = utk.cancelled() => {
-                                tracing::debug!(tag = %utag, "udp listener stopped");
-                            }
-                            r = uh.serve_udp(sock, &ctx, &ud, &policy) => {
+                            _ = utk.cancelled() => {}
+                            r = uh.serve_udp(sock, ctx) => {
                                 if let Err(e) = r {
                                     tracing::debug!(error = %e, "udp listener ended");
                                 }
@@ -112,10 +126,17 @@ impl InboundManager {
             }
         }
 
+        // Per-node tower service tree.
+        let stream_transport = StreamTransport::new(stream, addr);
+        let proxy_svc = ProxyService::new(
+            handler.clone(),
+            self.route_svc.clone(),
+            self.ob_dispatch.clone(),
+        );
+        let tree: InboundTree =
+            TransportService::new(Arc::new(stream_transport), proxy_svc, tag.clone());
+
         // TCP accept loop.
-        let acc_handler = handler.clone();
-        let disp = self.disp.clone();
-        let policy = self.policy;
         let acc_tag = tag.clone();
         let acc_token = token.clone();
         tracing::info!(tag = %acc_tag, %addr, "listening");
@@ -137,42 +158,22 @@ impl InboundManager {
                             tracing::warn!(error = %e, "accept failed");
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         } else if e.kind() != std::io::ErrorKind::ConnectionAborted {
-                            // ConnectionAborted is harmless (client dropped before accept);
-                            // log everything else.
                             tracing::warn!(error = %e, "accept failed");
                         }
                         continue;
                     }
                 };
                 let _ = tcp.set_nodelay(true);
-                let handler = acc_handler.clone();
-                let disp = disp.clone();
-                let stream_cfg = stream.clone();
-                let tag = acc_tag.clone();
+                let tree = tree.clone();
                 tokio::spawn(async move {
-                    match accept_conn(tcp, &stream_cfg).await {
-                        Ok(Accepted::Single(stream)) => {
-                            let ctx = Ctx::new(tag, Some(peer));
-                            if let Err(e) = handler.serve(&ctx, stream, &disp, &policy).await {
-                                tracing::debug!(session = ctx.id, error = %e, "connection ended");
-                            }
-                        }
-                        Ok(Accepted::Multiplexed(mut rx)) => {
-                            while let Some(stream) = rx.recv().await {
-                                let handler = handler.clone();
-                                let disp = disp.clone();
-                                let tag = tag.clone();
-                                tokio::spawn(async move {
-                                    let ctx = Ctx::new(tag, Some(peer));
-                                    if let Err(e) = handler.serve(&ctx, stream, &disp, &policy).await {
-                                        tracing::debug!(session = ctx.id, error = %e, "connection ended");
-                                    }
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "stream setup failed");
-                        }
+                    if let Err(e) = tree
+                        .oneshot(Incoming {
+                            conn: tcp,
+                            source: Some(peer),
+                        })
+                        .await
+                    {
+                        tracing::debug!(error = %e, "connection ended");
                     }
                 });
             }

@@ -4,8 +4,8 @@
 use bytes::Bytes;
 use compact_str::CompactString;
 
-use kernel::types::error::Error;
-use kernel::types::net::{self, AddrCodec};
+use kernel::Error;
+use kernel::net::{self, AddrCodec};
 use kernel::{Destination, Network};
 
 use super::crypto::fnv1a;

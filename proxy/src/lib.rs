@@ -17,6 +17,7 @@ pub mod dokodemo;
 pub mod http;
 pub mod io;
 pub mod mux;
+pub mod outbound;
 pub mod shadowsocks;
 pub mod socks;
 pub mod trojan;
@@ -24,23 +25,52 @@ pub mod udp;
 pub mod vless;
 pub mod vmess;
 
-use std::future::Future;
 use std::io as stdio;
 use std::sync::Arc;
 
-use kernel::{Ctx, Dispatcher, Policy};
+use kernel::{
+    CachedResolver, ConnectionPolicy, Ctx, Network, Proxy, ProxyDecision, Stats, SystemDialer,
+};
 use tokio::net::UdpSocket;
-use transport::Stream;
 
 pub use dokodemo::Dokodemo;
 pub use http::{Http, HttpAccount};
+pub use outbound::{Outbound, SocksOutbound, SsOutbound};
 pub use shadowsocks::Shadowsocks;
 pub use socks::{Socks, SocksAccount};
 pub use trojan::{Trojan, TrojanUsers};
 pub use vless::{Vless, VlessUsers};
 pub use vmess::{Vmess, VmessUsers};
 
-/// Closed sum of inbound handlers (SPEC §P1).
+/// The shared direct dialer handed to proxy decoders for self-servicing the
+/// flows the kernel tree cannot express (UDP-associated + mux sub-flows): those
+/// egress DIRECT through this dialer, while ordinary TCP flows route through the
+/// tower tree's outbound child.
+pub type SharedDialer = Arc<SystemDialer<CachedResolver>>;
+
+/// Runtime handle every inbound handler carries: the direct dialer (for UDP/mux
+/// self-service), the optional per-user traffic [`Stats`] registry, and the
+/// connection [`ConnectionPolicy`] (handshake + idle timeouts). Cheap to clone.
+#[derive(Clone)]
+pub struct ProxyContext {
+    pub dialer: SharedDialer,
+    pub stats: Option<Arc<Stats>>,
+    pub policy: ConnectionPolicy,
+}
+
+impl ProxyContext {
+    pub fn new(dialer: SharedDialer, stats: Option<Arc<Stats>>, policy: ConnectionPolicy) -> Self {
+        ProxyContext {
+            dialer,
+            stats,
+            policy,
+        }
+    }
+}
+
+/// Closed sum of inbound handlers (SPEC §P1). Implements [`kernel::Proxy`] by
+/// delegating `decode` to the active variant; the tower `ProxyService` drives
+/// it and routes the resulting flow.
 pub enum Inbound {
     Trojan(Trojan),
     Vless(Vless),
@@ -51,63 +81,48 @@ pub enum Inbound {
     Vmess(Vmess),
 }
 
-pub trait ProxyInbound {
-    /// Decode the proxy header, authenticate, and run the flow to completion.
-    fn serve(
-        &self,
-        ctx: &Ctx,
-        conn: Stream,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> impl Future<Output = stdio::Result<()>> + Send;
-}
+impl Proxy for Inbound {
+    type Auth = ();
 
-pub trait UdpProxyInbound {
-    fn serve_udp(
-        &self,
-        socket: Arc<UdpSocket>,
-        ctx: &Ctx,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> impl Future<Output = stdio::Result<()>> + Send;
-}
-
-impl ProxyInbound for Inbound {
-    async fn serve(
-        &self,
-        ctx: &Ctx,
-        conn: Stream,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> stdio::Result<()> {
+    fn networks(&self) -> &[Network] {
         match self {
-            Inbound::Trojan(h) => h.serve(ctx, conn, disp, policy).await,
-            Inbound::Vless(h) => h.serve(ctx, conn, disp, policy).await,
-            Inbound::Shadowsocks(h) => h.serve(ctx, conn, disp, policy).await,
-            Inbound::Socks(h) => h.serve(ctx, conn, disp, policy).await,
-            Inbound::Http(h) => h.serve(ctx, conn, disp, policy).await,
-            Inbound::Dokodemo(h) => h.serve(ctx, conn, disp, policy).await,
-            Inbound::Vmess(h) => h.serve(ctx, conn, disp, policy).await,
+            Inbound::Trojan(h) => h.networks(),
+            Inbound::Vless(h) => h.networks(),
+            Inbound::Shadowsocks(h) => h.networks(),
+            Inbound::Socks(h) => h.networks(),
+            Inbound::Http(h) => h.networks(),
+            Inbound::Dokodemo(h) => h.networks(),
+            Inbound::Vmess(h) => h.networks(),
+        }
+    }
+
+    async fn decode<S>(&self, ctx: Ctx, stream: S) -> stdio::Result<ProxyDecision>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        match self {
+            Inbound::Trojan(h) => h.decode(ctx, stream).await,
+            Inbound::Vless(h) => h.decode(ctx, stream).await,
+            Inbound::Shadowsocks(h) => h.decode(ctx, stream).await,
+            Inbound::Socks(h) => h.decode(ctx, stream).await,
+            Inbound::Http(h) => h.decode(ctx, stream).await,
+            Inbound::Dokodemo(h) => h.decode(ctx, stream).await,
+            Inbound::Vmess(h) => h.decode(ctx, stream).await,
         }
     }
 }
 
 impl Inbound {
-    /// Whether this inbound also binds a UDP socket on its port.
+    /// Whether this inbound needs a standalone UDP listener socket bound on its
+    /// port (only Shadowsocks; SOCKS/Trojan/VLESS carry UDP over the stream).
     pub fn binds_udp(&self) -> bool {
         matches!(self, Inbound::Shadowsocks(_))
     }
 
-    /// Serve the inbound's UDP socket (only protocols with a UDP listener).
-    pub async fn serve_udp(
-        &self,
-        socket: Arc<UdpSocket>,
-        ctx: &Ctx,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> stdio::Result<()> {
+    /// Drive the inbound's standalone UDP socket (no-op unless it binds one).
+    pub async fn serve_udp(&self, socket: Arc<UdpSocket>, ctx: Ctx) -> stdio::Result<()> {
         match self {
-            Inbound::Shadowsocks(h) => h.serve_udp(socket, ctx, disp, policy).await,
+            Inbound::Shadowsocks(h) => h.serve_udp(socket, ctx).await,
             _ => Ok(()),
         }
     }

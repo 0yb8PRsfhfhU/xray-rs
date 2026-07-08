@@ -8,7 +8,7 @@ use openssl::x509::X509;
 use tokio::net::TcpStream;
 use tokio_openssl::SslStream;
 
-use kernel::types::error::{Error, Result};
+use kernel::error::{Error, Result};
 
 /// A reusable TLS server context built from a PEM cert chain + key.
 pub struct TlsServer {

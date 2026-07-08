@@ -19,8 +19,11 @@ pub mod stream;
 pub mod tls;
 pub mod ws;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
+
+use kernel::{Accepted, Transport};
 
 pub use grpc::GrpcConfig;
 pub use httpupgrade::HttpUpgradeConfig;
@@ -61,18 +64,10 @@ impl StreamConfig {
     }
 }
 
-/// One accepted connection. Raw / websocket / httpupgrade map one TCP/TLS
-/// connection to exactly one logical stream; gRPC multiplexes many `Tun` streams
-/// over one HTTP/2 connection, delivered as they arrive.
-pub enum Accepted {
-    Single(Stream),
-    Multiplexed(tokio::sync::mpsc::Receiver<Stream>),
-}
-
 /// Apply security then transport to an accepted TCP connection. Raw / websocket
 /// / httpupgrade yield a single composed [`Stream`]; gRPC yields a receiver of
 /// streams multiplexed over one HTTP/2 connection.
-pub async fn accept_conn(tcp: TcpStream, cfg: &StreamConfig) -> std::io::Result<Accepted> {
+pub async fn accept_conn(tcp: TcpStream, cfg: &StreamConfig) -> std::io::Result<Accepted<Stream>> {
     let raw = match &cfg.security {
         Security::None => stream::RawNetworkStream::Tcp(tcp),
         Security::Tls(server) => stream::RawNetworkStream::Tls(Box::new(server.accept(tcp).await?)),
@@ -85,4 +80,34 @@ pub async fn accept_conn(tcp: TcpStream, cfg: &StreamConfig) -> std::io::Result<
         }
         TransportKind::Grpc(c) => Accepted::Multiplexed(grpc::serve(raw, c).await?),
     })
+}
+
+/// A concrete [`kernel::Transport`]: owns its listen address (objective req. 3)
+/// and frames one accepted raw TCP connection into a proxy-ready [`Stream`] by
+/// applying the configured security + transport layers via [`accept_conn`].
+pub struct StreamTransport {
+    cfg: StreamConfig,
+    listen: SocketAddr,
+}
+
+impl StreamTransport {
+    pub fn new(cfg: StreamConfig, listen: SocketAddr) -> StreamTransport {
+        StreamTransport { cfg, listen }
+    }
+}
+
+impl Transport for StreamTransport {
+    type Conn = TcpStream;
+    type Stream = Stream;
+
+    fn listen_addr(&self) -> SocketAddr {
+        self.listen
+    }
+
+    fn accept(
+        &self,
+        conn: TcpStream,
+    ) -> impl Future<Output = std::io::Result<Accepted<Stream>>> + Send {
+        accept_conn(conn, &self.cfg)
+    }
 }

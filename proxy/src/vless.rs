@@ -7,23 +7,24 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use bytes::Bytes;
 use compact_str::CompactString;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use kernel::types::error::Error;
-use kernel::types::net::{self, AddrCodec};
-use kernel::{Ctx, Destination, Dispatcher, Policy, Timer, Uuid};
-use transport::Stream;
+use kernel::net::{self, AddrCodec};
+use kernel::{
+    Ctx, Destination, Error, LINK_CAPACITY, Network, Proxy, ProxyDecision, Timer, Uuid, pipe,
+};
 
-use crate::ProxyInbound;
-use crate::io::{read_header, relay_tcp};
-use crate::udp::relay_vless_udp;
+use crate::ProxyContext;
+use crate::io::{
+    noop_decision, read_header, relay_stream, sniff_override, user_counter, user_hash,
+};
 
 const CMD_TCP: u8 = 1;
 const CMD_UDP: u8 = 2;
 const CMD_MUX: u8 = 3;
+const NETWORKS: &[Network] = &[Network::Tcp, Network::Udp];
 
 /// A VLESS user identity.
 #[derive(Debug)]
@@ -92,13 +93,15 @@ fn parse(buf: &mut Bytes, users: &VlessUsers) -> Result<(VlessReq, CompactString
 
 /// VLESS inbound handler.
 pub struct Vless {
-    users: ArcSwap<VlessUsers>,
+    users: arc_swap::ArcSwap<VlessUsers>,
+    cx: ProxyContext,
 }
 
 impl Vless {
-    pub fn new(users: Arc<VlessUsers>) -> Vless {
+    pub fn new(users: Arc<VlessUsers>, cx: ProxyContext) -> Vless {
         Vless {
-            users: ArcSwap::from(users),
+            users: arc_swap::ArcSwap::from(users),
+            cx,
         }
     }
 
@@ -107,44 +110,63 @@ impl Vless {
         self.users.store(users);
     }
 
-    pub async fn process(
-        &self,
-        ctx: &Ctx,
-        mut conn: Stream,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> io::Result<()> {
-        let users = self.users.load_full();
-        let ((req, email), leftover) = read_header(&mut conn, policy.handshake, 16384, move |b| {
-            parse(b, &users)
-        })
-        .await?;
-        // Response header: version 0, zero-length addons.
-        conn.write_all(&[0u8, 0u8]).await?;
-        let ctx = ctx.with_user(email);
-        let ctx = &ctx;
-        match req {
-            VlessReq::Tcp(dest) => {
-                let timer = Timer::new(policy.idle);
-                relay_tcp(conn, dest, leftover, ctx, disp, timer).await
-            }
-            VlessReq::Udp(dest) => {
-                let timer = Timer::new(policy.idle);
-                relay_vless_udp(conn, dest, leftover, ctx, disp, timer).await
-            }
-            VlessReq::Mux => crate::mux::serve(conn, leftover, ctx, disp, policy).await,
-        }
+    pub fn networks(&self) -> &'static [Network] {
+        NETWORKS
     }
 }
 
-impl ProxyInbound for Vless {
-    async fn serve(
-        &self,
-        ctx: &Ctx,
-        conn: Stream,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> io::Result<()> {
-        Vless::process(self, ctx, conn, disp, policy).await
+impl Proxy for Vless {
+    type Auth = ();
+
+    fn networks(&self) -> &[Network] {
+        NETWORKS
+    }
+
+    async fn decode<S>(&self, ctx: Ctx, mut stream: S) -> io::Result<ProxyDecision>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let users = self.users.load_full();
+        let ((req, email), leftover) = read_header(
+            &mut stream,
+            self.cx.policy.handshake_timeout,
+            16384,
+            move |b| parse(b, &users),
+        )
+        .await?;
+        // Response header: version 0, zero-length addons.
+        stream.write_all(&[0u8, 0u8]).await?;
+        let hash = user_hash(email.as_bytes());
+        let ctx = ctx.with_user(email, hash);
+        let timer = Timer::new(self.cx.policy.idle_timeout);
+        let counter = user_counter(&ctx, self.cx.stats.as_ref()).await;
+        match req {
+            VlessReq::Tcp(dest) => {
+                let target = sniff_override(dest, &leftover);
+                let (inbound, outbound) = pipe(LINK_CAPACITY);
+                tokio::spawn(relay_stream(stream, inbound, timer, counter, leftover));
+                Ok(ProxyDecision {
+                    target,
+                    ctx,
+                    link: outbound,
+                })
+            }
+            VlessReq::Udp(dest) => {
+                crate::udp::relay_vless_udp(
+                    stream,
+                    dest,
+                    leftover,
+                    self.cx.dialer.as_ref(),
+                    timer,
+                    counter,
+                )
+                .await?;
+                Ok(noop_decision(ctx))
+            }
+            VlessReq::Mux => {
+                crate::mux::serve(stream, leftover, self.cx.dialer.clone(), self.cx.policy).await?;
+                Ok(noop_decision(ctx))
+            }
+        }
     }
 }

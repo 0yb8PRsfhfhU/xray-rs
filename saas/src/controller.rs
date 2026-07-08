@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use compact_str::CompactString;
 use kernel::Stats;
+use proxy::ProxyContext;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{ApiError, NodeInfo, UserInfo, UserTraffic};
@@ -29,6 +30,7 @@ pub struct Controller {
     cfg: ControllerConfig,
     ibm: Arc<InboundManager>,
     stats: Arc<Stats>,
+    cx: ProxyContext,
     node_info: Option<NodeInfo>,
     node_tag: CompactString,
     user_list: Vec<UserInfo>,
@@ -40,12 +42,14 @@ impl Controller {
         cfg: ControllerConfig,
         ibm: Arc<InboundManager>,
         stats: Arc<Stats>,
+        cx: ProxyContext,
     ) -> Controller {
         Controller {
             api,
             cfg,
             ibm,
             stats,
+            cx,
             node_info: None,
             node_tag: CompactString::default(),
             user_list: Vec::new(),
@@ -73,7 +77,7 @@ impl Controller {
             Err(e) => return Err(e).context("initial GetUserList"),
         };
 
-        let built = build_inbound(&node, &users, &self.cfg.listen_ip, &self.cfg.cert)?;
+        let built = build_inbound(&node, &users, &self.cfg.listen_ip, &self.cfg.cert, &self.cx)?;
         let tag = built.tag.clone();
         tracing::debug!(
             tag = %tag,
@@ -170,13 +174,14 @@ impl Controller {
             self.ibm.remove(&old_tag);
             self.prune_all_stats(&old_tag).await;
 
-            let built = match build_inbound(&node, &users, &self.cfg.listen_ip, &self.cfg.cert) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!(error = %e, "rebuilding inbound failed");
-                    return;
-                }
-            };
+            let built =
+                match build_inbound(&node, &users, &self.cfg.listen_ip, &self.cfg.cert, &self.cx) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(error = %e, "rebuilding inbound failed");
+                        return;
+                    }
+                };
             let tag = built.tag.clone();
             if let Err(e) = self.ibm.add(built) {
                 tracing::error!(error = %e, "rebinding inbound failed");

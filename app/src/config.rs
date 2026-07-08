@@ -1,22 +1,35 @@
 //! TOML configuration schema and the build step that turns it into runtime
 //! objects. The legacy xray JSON format is intentionally not used (objective).
 
-use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use compact_str::CompactString;
 use serde::Deserialize;
 
-use kernel::controller::router::{Cidr, DomainMatcher, Router, Rule};
-use kernel::{CachedResolver, Dispatcher, Network, Outbound, SystemDialer};
+use kernel::{
+    BalanceMode, CachedResolver, Condition, ConnectionPolicy, MatchRule, NoGeo, OutboundDispatch,
+    OutboundList, ProxyService, RouteService, RouteTable, SystemDialer,
+};
 use proxy::{
-    Dokodemo, Http, HttpAccount, Inbound, Shadowsocks, Socks, SocksAccount, Trojan, TrojanUsers,
-    Vless, VlessUsers, Vmess, VmessUsers,
+    Dokodemo, Http, HttpAccount, Inbound, ProxyContext, Shadowsocks, Socks, SocksAccount, Trojan,
+    TrojanUsers, Vless, VlessUsers, Vmess, VmessUsers,
 };
 use transport::{
-    GrpcConfig, HttpUpgradeConfig, Security, StreamConfig, TlsServer, TransportKind, WsConfig,
+    GrpcConfig, HttpUpgradeConfig, Security, StreamConfig, StreamTransport, TlsServer,
+    TransportKind, WsConfig,
 };
+
+/// Concrete outbound sum used by both binaries (freedom / blackhole / ss / socks).
+type Ob = proxy::Outbound;
+/// The system dialer specialised on the shared cached resolver.
+type Dial = SystemDialer<CachedResolver>;
+/// The tower service tree for one inbound: transport → proxy → (route, outbound).
+type RouteChild = RouteService<NoGeo>;
+type ObChild = OutboundDispatch<Ob, Dial>;
+type ProxySvc = ProxyService<Inbound, RouteChild, ObChild>;
+pub type InboundTree = kernel::TransportService<StreamTransport, ProxySvc>;
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -186,7 +199,11 @@ impl OutboundProtocolCfg {
     }
 }
 
+/// A config route. `source`/`network`/`inbound`/`protocol` are parsed for
+/// config compatibility but have no kernel-router equivalent, so they are
+/// intentionally ignored (only `domain`/`ip`/`port` map to conditions).
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct RouteCfg {
     pub outbound: String,
     #[serde(default)]
@@ -205,19 +222,18 @@ pub struct RouteCfg {
     pub protocol: Vec<String>,
 }
 
-/// A fully built inbound: where to listen, how to wrap the stream, and the
-/// handler that decodes it.
+/// A fully built inbound: its listen address, the tower service tree that
+/// frames + decodes + routes it, and the handler (kept for the standalone UDP
+/// listener path, which lives outside the tree).
 pub struct InboundInstance {
     pub tag: CompactString,
-    pub listen: String,
-    pub port: u16,
-    pub stream: StreamConfig,
+    pub listen: SocketAddr,
+    pub tree: InboundTree,
     pub handler: Arc<Inbound>,
 }
 
 /// Everything the runtime needs after parsing config.
 pub struct Built {
-    pub dispatcher: Arc<Dispatcher>,
     pub inbounds: Vec<InboundInstance>,
 }
 
@@ -226,118 +242,113 @@ impl Config {
         toml::from_str(text).context("parsing TOML config")
     }
 
-    /// Build runtime objects (dispatcher, inbounds) from the parsed config.
+    /// Build the runtime service tree from the parsed config: one shared route +
+    /// outbound child, and one `TransportService` → `ProxyService` per inbound.
     pub fn build(self) -> Result<Built> {
         let resolver = Arc::new(CachedResolver::system()?);
-        let dialer = SystemDialer::new(resolver);
+        let dialer = Arc::new(SystemDialer::new(resolver));
+        let policy = ConnectionPolicy::default();
 
-        let mut outbounds: HashMap<CompactString, Outbound> = HashMap::new();
-        let mut default_tag: Option<CompactString> = None;
+        // Outbound set (tag-keyed). The first freedom-kind outbound services the
+        // default/"direct" route branch.
+        let mut items: Vec<(CompactString, Ob)> = Vec::new();
+        let mut freedom_tag: Option<CompactString> = None;
         for ob in &self.outbounds {
             let tag = CompactString::new(ob.tag.as_deref().unwrap_or(ob.protocol.default_tag()));
             let outbound = match ob.protocol {
-                OutboundProtocolCfg::Freedom => Outbound::Freedom,
-                OutboundProtocolCfg::Blackhole => Outbound::Blackhole,
+                OutboundProtocolCfg::Freedom => {
+                    if freedom_tag.is_none() {
+                        freedom_tag = Some(tag.clone());
+                    }
+                    Ob::Freedom
+                }
+                OutboundProtocolCfg::Blackhole => Ob::Blackhole,
             };
-            if default_tag.is_none() {
-                default_tag = Some(tag.clone());
-            }
-            outbounds.insert(tag, outbound);
+            items.push((tag, outbound));
         }
-        if outbounds.is_empty() {
-            outbounds.insert(CompactString::new("freedom"), Outbound::Freedom);
-            default_tag = Some(CompactString::new("freedom"));
+        if items.is_empty() {
+            items.push((CompactString::new("freedom"), Ob::Freedom));
+            freedom_tag = Some(CompactString::new("freedom"));
         }
-        let default_tag = default_tag.unwrap_or_else(|| CompactString::new("freedom"));
+        let freedom_tag = freedom_tag.or_else(|| items.first().map(|(t, _)| t.clone()));
+        let outbounds = Arc::new(OutboundList::new(items));
 
-        let router = if self.routes.is_empty() {
-            None
-        } else {
-            let mut rules = Vec::new();
-            for r in &self.routes {
-                rules.push(build_rule(r)?);
+        // Route table: first-match rules over what the kernel router can express
+        // (domain / ip / port); the absent default branch resolves to freedom.
+        let mut rules = Vec::new();
+        for r in &self.routes {
+            if let Some(rule) = build_match_rule(r)? {
+                rules.push(rule);
             }
-            Some(Router::new(rules))
-        };
+        }
+        let route_table = Arc::new(RouteTable::new(rules, None));
 
-        let dispatcher = Arc::new(Dispatcher::new(dialer, outbounds, default_tag, router));
+        // Children shared by every inbound (cloned into each ProxyService).
+        let route_svc = RouteService::new(route_table, Arc::new(NoGeo));
+        let ob_dispatch = OutboundDispatch::new(outbounds, dialer.clone(), freedom_tag);
+        let cx = ProxyContext::new(dialer, None, policy);
 
         let mut inbounds = Vec::new();
         for ib in self.inbounds {
-            inbounds.push(build_inbound(ib)?);
+            inbounds.push(build_inbound(ib, &cx, &route_svc, &ob_dispatch)?);
         }
 
-        Ok(Built {
-            dispatcher,
-            inbounds,
-        })
+        Ok(Built { inbounds })
     }
 }
 
-fn build_rule(r: &RouteCfg) -> Result<Rule> {
-    let mut rule = Rule {
-        outbound_tag: CompactString::new(&r.outbound),
-        ..Rule::default()
-    };
-    for n in &r.network {
-        match n.as_str() {
-            "tcp" => rule.networks.push(Network::Tcp),
-            "udp" => rule.networks.push(Network::Udp),
-            other => bail!("bad route network: {other}"),
-        }
-    }
+/// Translate one config route into a kernel [`MatchRule`], or `None` when it
+/// carries no condition the kernel router can express. The kernel router models
+/// domain / ip / port / geo conditions OR-combined; the config's `source`,
+/// `network`, `inbound`, and `protocol` selectors have no kernel equivalent and
+/// are ignored (a rule reduced to nothing is dropped).
+fn build_match_rule(r: &RouteCfg) -> Result<Option<MatchRule>> {
+    let mut conds: Vec<Condition> = Vec::new();
     for d in &r.domain {
-        rule.domains.push(parse_domain_matcher(d));
+        if let Some(c) = domain_condition(d) {
+            conds.push(c);
+        }
     }
     for ip in &r.ip {
-        rule.ips
-            .push(Cidr::parse(ip).ok_or_else(|| anyhow!("bad ip cidr: {ip}"))?);
-    }
-    for s in &r.source {
-        rule.source_ips
-            .push(Cidr::parse(s).ok_or_else(|| anyhow!("bad source cidr: {s}"))?);
+        let c =
+            Condition::parse(&format!("ip:{ip}")).ok_or_else(|| anyhow!("bad ip cidr: {ip}"))?;
+        conds.push(c);
     }
     for p in &r.port {
-        rule.ports.push(parse_port_range(p)?);
+        let c = Condition::parse(&format!("port:{p}")).ok_or_else(|| anyhow!("bad port: {p}"))?;
+        conds.push(c);
     }
-    for t in &r.inbound_tag {
-        rule.inbound_tags.push(CompactString::new(t));
+    if conds.is_empty() {
+        return Ok(None);
     }
-    for p in &r.protocol {
-        rule.protocols.push(CompactString::new(p));
-    }
-    Ok(rule)
+    let outs = vec![CompactString::new(&r.outbound)];
+    Ok(Some(MatchRule::new(conds, outs, BalanceMode::Random)))
 }
 
-fn parse_domain_matcher(s: &str) -> DomainMatcher {
-    if let Some(rest) = s.strip_prefix("full:") {
-        DomainMatcher::Full(CompactString::new(rest))
-    } else if let Some(rest) = s.strip_prefix("keyword:") {
-        DomainMatcher::Keyword(CompactString::new(rest))
-    } else if let Some(rest) = s.strip_prefix("suffix:") {
-        DomainMatcher::Suffix(CompactString::new(rest))
-    } else if let Some(rest) = s.strip_prefix("domain:") {
-        DomainMatcher::Suffix(CompactString::new(rest))
+/// Map a config domain matcher token to a kernel [`Condition`]. `full:`/`suffix:`
+/// collapse to a suffix match (the kernel has no exact-only match); `geosite:`
+/// passes through; `keyword:` has no kernel equivalent and is dropped.
+fn domain_condition(d: &str) -> Option<Condition> {
+    let token = if let Some(x) = d.strip_prefix("full:") {
+        format!("domain:{x}")
+    } else if let Some(x) = d.strip_prefix("suffix:") {
+        format!("domain:{x}")
+    } else if d.starts_with("domain:") || d.starts_with("geosite:") {
+        d.to_string()
+    } else if d.strip_prefix("keyword:").is_some() {
+        return None;
     } else {
-        DomainMatcher::Suffix(CompactString::new(s))
-    }
+        format!("domain:{d}")
+    };
+    Condition::parse(&token)
 }
 
-fn parse_port_range(s: &str) -> Result<(u16, u16)> {
-    match s.split_once('-') {
-        Some((a, b)) => {
-            let lo: u16 = a.trim().parse().context("port range low")?;
-            let hi: u16 = b.trim().parse().context("port range high")?;
-            Ok((lo.min(hi), lo.max(hi)))
-        }
-        None => {
-            let p: u16 = s.trim().parse().context("port")?;
-            Ok((p, p))
-        }
-    }
-}
-
-fn build_inbound(ib: InboundCfg) -> Result<InboundInstance> {
+fn build_inbound(
+    ib: InboundCfg,
+    cx: &ProxyContext,
+    route_svc: &RouteChild,
+    ob_dispatch: &ObChild,
+) -> Result<InboundInstance> {
     let InboundCfg {
         tag,
         listen,
@@ -357,7 +368,10 @@ fn build_inbound(ib: InboundCfg) -> Result<InboundInstance> {
                     kernel::Uuid::parse_str(&user.uuid).map_err(|e| anyhow!("bad uuid: {e}"))?;
                 built_users.push((id, CompactString::new(&user.email), user.level));
             }
-            Inbound::Vless(Vless::new(Arc::new(VlessUsers::new(built_users))))
+            Inbound::Vless(Vless::new(
+                Arc::new(VlessUsers::new(built_users)),
+                cx.clone(),
+            ))
         }
         InboundProtocolCfg::Vmess { users } => {
             let mut built_users = Vec::new();
@@ -367,14 +381,17 @@ fn build_inbound(ib: InboundCfg) -> Result<InboundInstance> {
                 built_users.push((id, CompactString::new(&user.email), user.level));
             }
             let table = VmessUsers::new(built_users).map_err(|e| anyhow!("vmess users: {e}"))?;
-            Inbound::Vmess(Vmess::new(Arc::new(table)))
+            Inbound::Vmess(Vmess::new(Arc::new(table), cx.clone()))
         }
         InboundProtocolCfg::Trojan { users } => {
             let mut built_users = Vec::new();
             for user in users {
                 built_users.push((user.password, CompactString::new(&user.email), user.level));
             }
-            Inbound::Trojan(Trojan::new(Arc::new(TrojanUsers::new(built_users))))
+            Inbound::Trojan(Trojan::new(
+                Arc::new(TrojanUsers::new(built_users)),
+                cx.clone(),
+            ))
         }
         InboundProtocolCfg::Shadowsocks { method, users } => {
             let kind = proxy::shadowsocks::method_kind(&method)
@@ -383,7 +400,7 @@ fn build_inbound(ib: InboundCfg) -> Result<InboundInstance> {
             for user in users {
                 built_users.push((user.password, CompactString::new(&user.email), user.level));
             }
-            Inbound::Shadowsocks(Shadowsocks::new(kind, built_users))
+            Inbound::Shadowsocks(Shadowsocks::new(kind, built_users, cx.clone()))
         }
         InboundProtocolCfg::Socks { users } => {
             let mut accounts = Vec::new();
@@ -393,7 +410,7 @@ fn build_inbound(ib: InboundCfg) -> Result<InboundInstance> {
                     password: user.password,
                 });
             }
-            Inbound::Socks(Socks::new(accounts))
+            Inbound::Socks(Socks::new(accounts, cx.clone()))
         }
         InboundProtocolCfg::Http { users } => {
             let mut accounts = Vec::new();
@@ -403,7 +420,7 @@ fn build_inbound(ib: InboundCfg) -> Result<InboundInstance> {
                     password: user.password,
                 });
             }
-            Inbound::Http(Http::new(accounts))
+            Inbound::Http(Http::new(accounts, cx.clone()))
         }
         InboundProtocolCfg::Dokodemo {
             target_address,
@@ -411,17 +428,25 @@ fn build_inbound(ib: InboundCfg) -> Result<InboundInstance> {
         } => Inbound::Dokodemo(Dokodemo::new(
             kernel::Address::parse(&target_address),
             target_port,
+            cx.clone(),
         )),
     };
 
     let stream = build_stream(tls, transport)?;
+    let addr: SocketAddr = format!("{listen}:{port}")
+        .parse()
+        .with_context(|| format!("invalid listen address {listen}:{port}"))?;
+
+    let handler = Arc::new(handler);
+    let transport_svc = StreamTransport::new(stream, addr);
+    let proxy_svc = ProxyService::new(handler.clone(), route_svc.clone(), ob_dispatch.clone());
+    let tree = kernel::TransportService::new(Arc::new(transport_svc), proxy_svc, tag.clone());
 
     Ok(InboundInstance {
         tag,
-        listen,
-        port,
-        stream,
-        handler: Arc::new(handler),
+        listen: addr,
+        tree,
+        handler,
     })
 }
 

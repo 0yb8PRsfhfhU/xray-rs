@@ -1,13 +1,14 @@
-//! Compile the small egress TOML DSL into kernel routing objects.
+//! Compile the small egress TOML DSL into kernel routing objects: a tag-keyed
+//! outbound set plus a first-match [`RouteTable`]. The default branch resolves
+//! to freedom (the `default-direct` outbound).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use compact_str::CompactString;
-use kernel::controller::router::{Cidr, DomainMatcher, Router, Rule};
-use kernel::egress::outbound::{SocksOutbound, SsOutbound};
-use kernel::{Address, Outbound};
+
+use kernel::{Address, BalanceMode, Condition, MatchRule, RouteTable};
+use proxy::{Outbound, SocksOutbound, SsOutbound};
 
 use crate::egress_config::{EgressConfig, OutSpec};
 
@@ -44,31 +45,13 @@ pub enum RuleExpr {
     CatchAll,
 }
 
-/// Compiled runtime egress objects.
+/// Compiled runtime egress objects: the tag-keyed outbound set (for an
+/// `OutboundList`), the first-match route table, and the tag that services the
+/// default/"direct" branch.
 pub struct CompiledEgress {
-    pub default_tag: CompactString,
-    pub router: Option<Router>,
-    pub outbounds: HashMap<CompactString, Outbound>,
-}
-
-/// Resolver hook for future geosite/geoip data. The default resolver skips
-/// geodata while keeping explicit domain/IP rules active.
-pub trait GeoResolver {
-    fn geosite(&self, name: &str) -> Vec<DomainMatcher>;
-    fn geoip(&self, name: &str) -> Vec<Cidr>;
-}
-
-/// No-op geodata resolver. `geosite:*` and `geoip:*` are warned and skipped.
-pub struct NoopGeoResolver;
-
-impl GeoResolver for NoopGeoResolver {
-    fn geosite(&self, _name: &str) -> Vec<DomainMatcher> {
-        Vec::new()
-    }
-
-    fn geoip(&self, _name: &str) -> Vec<Cidr> {
-        Vec::new()
-    }
+    pub freedom_tag: Option<CompactString>,
+    pub route_table: RouteTable,
+    pub outbounds: Vec<(CompactString, Outbound)>,
 }
 
 /// Normalize raw TOML into a stable IR. Routes with only comment labels are
@@ -123,54 +106,45 @@ pub fn normalize(cfg: &EgressConfig) -> Result<NormalizedEgress> {
     })
 }
 
-/// Compile using [`NoopGeoResolver`].
+/// Compile raw config into a kernel outbound set + route table.
 pub fn compile(cfg: &EgressConfig) -> Result<CompiledEgress> {
-    compile_with_geo(cfg, &NoopGeoResolver)
-}
-
-/// Compile raw config into kernel outbounds and router.
-pub fn compile_with_geo(cfg: &EgressConfig, geo: &impl GeoResolver) -> Result<CompiledEgress> {
     if !cfg.enable {
         let default_tag = CompactString::new("default-direct");
-        let mut outbounds = HashMap::new();
-        outbounds.insert(default_tag.clone(), Outbound::Freedom);
         return Ok(CompiledEgress {
-            default_tag,
-            router: None,
-            outbounds,
+            freedom_tag: Some(default_tag.clone()),
+            route_table: RouteTable::new(Vec::new(), None),
+            outbounds: vec![(default_tag, Outbound::Freedom)],
         });
     }
-
     let normalized = normalize(cfg)?;
-    compile_normalized(&normalized, geo)
+    compile_normalized(&normalized)
 }
 
 /// Compile already-normalized egress IR.
-pub fn compile_normalized(
-    normalized: &NormalizedEgress,
-    geo: &impl GeoResolver,
-) -> Result<CompiledEgress> {
-    let mut outbounds = HashMap::new();
+pub fn compile_normalized(normalized: &NormalizedEgress) -> Result<CompiledEgress> {
+    let mut outbounds = Vec::with_capacity(normalized.outbounds.len());
     for named in &normalized.outbounds {
-        outbounds.insert(named.tag.clone(), compile_outbound(&named.spec)?);
+        outbounds.push((named.tag.clone(), compile_outbound(&named.spec)?));
     }
 
     let mut rules = Vec::new();
     for route in &normalized.routes {
-        for expr in &route.rules {
-            compile_rule_expr(expr, &route.tag, geo, &mut rules);
+        let conds = rule_conditions(&route.rules);
+        if conds.is_empty() {
+            continue;
         }
+        rules.push(MatchRule::new(
+            conds,
+            vec![route.tag.clone()],
+            BalanceMode::Random,
+        ));
     }
-
-    let router = if rules.is_empty() {
-        None
-    } else {
-        Some(Router::new(rules))
-    };
+    // Absent default branch => Freedom (the default-direct outbound).
+    let route_table = RouteTable::new(rules, None);
 
     Ok(CompiledEgress {
-        default_tag: normalized.default_tag.clone(),
-        router,
+        freedom_tag: Some(normalized.default_tag.clone()),
+        route_table,
         outbounds,
     })
 }
@@ -243,65 +217,34 @@ fn compile_outbound(spec: &OutSpec) -> Result<Outbound> {
     }
 }
 
-fn compile_rule_expr(
-    expr: &RuleExpr,
-    tag: &CompactString,
-    geo: &impl GeoResolver,
-    out: &mut Vec<Rule>,
-) {
-    match expr {
-        RuleExpr::DomainSuffix(s) => out.push(domain_rule(tag, DomainMatcher::Suffix(s.clone()))),
-        RuleExpr::DomainFull(s) => out.push(domain_rule(tag, DomainMatcher::Full(s.clone()))),
-        RuleExpr::DomainKeyword(s) => {
-            out.push(domain_rule(tag, DomainMatcher::Keyword(s.clone())));
-        }
-        RuleExpr::GeoSite(name) => {
-            let domains = geo.geosite(name);
-            if domains.is_empty() {
-                tracing::warn!(geosite = %name, "geosite rule skipped: no geodata resolver");
-            } else {
-                let mut rule = Rule {
-                    outbound_tag: tag.clone(),
-                    ..Rule::default()
-                };
-                rule.domains.extend(domains);
-                out.push(rule);
+/// Translate a route's matcher expressions into kernel [`Condition`]s, OR-combined
+/// in the resulting [`MatchRule`]. `full:` collapses to a suffix match (no exact
+/// match in the kernel router); `keyword:` has no kernel equivalent and is
+/// dropped; `geosite:`/`geoip:` become geo conditions (matched only when a geo
+/// resolver is wired — otherwise they never match).
+fn rule_conditions(exprs: &[RuleExpr]) -> Vec<Condition> {
+    let mut conds = Vec::new();
+    for expr in exprs {
+        match expr {
+            RuleExpr::DomainSuffix(s) | RuleExpr::DomainFull(s) => {
+                conds.push(Condition::DomainSuffix(s.to_ascii_lowercase()));
             }
-        }
-        RuleExpr::GeoIp(name) => {
-            let ips = geo.geoip(name);
-            if ips.is_empty() {
-                tracing::warn!(geoip = %name, "geoip rule skipped: no geodata resolver");
-            } else {
-                let mut rule = Rule {
-                    outbound_tag: tag.clone(),
-                    ..Rule::default()
-                };
-                rule.ips.extend(ips);
-                out.push(rule);
+            RuleExpr::DomainKeyword(name) => {
+                tracing::warn!(keyword = %name, "keyword domain rule skipped: unsupported by kernel router");
             }
+            RuleExpr::GeoSite(name) => conds.push(Condition::GeoSite(name.clone())),
+            RuleExpr::GeoIp(name) => conds.push(Condition::GeoIp(name.clone())),
+            RuleExpr::CatchAll => conds.push(Condition::Any),
         }
-        RuleExpr::CatchAll => out.push(Rule {
-            outbound_tag: tag.clone(),
-            ..Rule::default()
-        }),
     }
-}
-
-fn domain_rule(tag: &CompactString, matcher: DomainMatcher) -> Rule {
-    let mut rule = Rule {
-        outbound_tag: tag.clone(),
-        ..Rule::default()
-    };
-    rule.domains.push(matcher);
-    rule
+    conds
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::egress_config::EgressConfig;
-    use kernel::{Destination, Network, RouteCtx};
+    use kernel::{Address, Destination, Network, NoGeo, RouteDecision, RouteQuery};
 
     #[test]
     fn normalize_skips_comments_and_keeps_catchall() {
@@ -342,30 +285,34 @@ mod tests {
         .expect("parse");
 
         let compiled = compile(&cfg).expect("compile");
-        let router = compiled.router.as_ref().expect("router");
         let dest = Destination::tcp(Address::parse("www.netflix.com"), 443);
-        let rc = RouteCtx {
-            network: Network::Tcp,
+        let q = RouteQuery {
             target: &dest,
-            inbound_tag: "in",
+            network: Network::Tcp,
             source: None,
             sniffed_domain: None,
-            protocol: None,
+            auth_hash: None,
         };
-
-        assert_eq!(router.pick(&rc), Some("route-000"));
-        assert!(compiled.outbounds.contains_key("default-direct"));
+        assert_eq!(
+            compiled.route_table.route(&q, &NoGeo),
+            RouteDecision::Outbound("route-000".into())
+        );
+        assert!(
+            compiled
+                .outbounds
+                .iter()
+                .any(|(t, _)| t == "default-direct")
+        );
     }
 
     #[test]
     fn disabled_config_is_plain_direct() {
         let cfg = EgressConfig::parse("enable = false").expect("parse");
         let compiled = compile(&cfg).expect("compile");
-        assert!(compiled.router.is_none());
-        assert_eq!(compiled.default_tag, "default-direct");
+        assert_eq!(compiled.freedom_tag.as_deref(), Some("default-direct"));
         assert!(matches!(
-            compiled.outbounds.get("default-direct"),
-            Some(Outbound::Freedom)
+            compiled.outbounds.first(),
+            Some((_, Outbound::Freedom))
         ));
     }
 }

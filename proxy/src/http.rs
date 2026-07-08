@@ -14,17 +14,22 @@ use std::io;
 
 use base64::Engine;
 use bytes::{BufMut, Bytes, BytesMut};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use kernel::types::error::Error;
-use kernel::{Address, Ctx, Destination, Dispatcher, Policy, Timer};
-use tokio::io::AsyncWriteExt;
-use transport::Stream;
+use kernel::{
+    Address, Ctx, Destination, Error, LINK_CAPACITY, Network, Proxy, ProxyDecision, Timer, pipe,
+};
 
-use crate::ProxyInbound;
-use crate::io::{read_header, relay_tcp};
+use crate::ProxyContext;
+use crate::io::{
+    noop_decision, read_header, relay_stream, sniff_override, user_counter, user_hash,
+};
 
 /// Maximum request-head size we will buffer before giving up (~16 KiB).
 const MAX_HEAD: usize = 16384;
+
+/// HTTP is TCP-only (no UDP association).
+const NETWORKS: &[Network] = &[Network::Tcp];
 
 /// A single HTTP proxy account for Basic `Proxy-Authorization`.
 #[derive(Debug, Clone)]
@@ -36,52 +41,62 @@ pub struct HttpAccount {
 /// HTTP proxy inbound handler. Empty `accounts` means no authentication.
 pub struct Http {
     accounts: Vec<HttpAccount>,
+    cx: ProxyContext,
 }
 
 impl Http {
-    pub fn new(accounts: Vec<HttpAccount>) -> Http {
-        Http { accounts }
+    pub fn new(accounts: Vec<HttpAccount>, cx: ProxyContext) -> Http {
+        Http { accounts, cx }
+    }
+
+    pub fn networks(&self) -> &'static [Network] {
+        NETWORKS
     }
 
     /// Validate Basic `Proxy-Authorization` against the configured accounts.
-    fn check_auth(&self, headers: &[&str]) -> bool {
-        let value = match header_value(headers, "proxy-authorization") {
-            Some(v) => v,
-            None => return false,
-        };
+    /// Returns the matched account username (borrowed from the table) so the
+    /// session can be attributed, or `None` when the header is absent/invalid or
+    /// no account matches.
+    fn check_auth(&self, headers: &[&str]) -> Option<&str> {
+        let value = header_value(headers, "proxy-authorization")?;
         // Auth scheme name is case-insensitive: "Basic <base64(user:pass)>".
         let encoded = if value.len() >= 6
             && value.get(..6).map(|p| p.eq_ignore_ascii_case("Basic ")) == Some(true)
         {
             value.get(6..).unwrap_or("").trim()
         } else {
-            return false;
+            return None;
         };
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        let creds = match std::str::from_utf8(&decoded) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        match creds.split_once(':') {
-            Some((user, pass)) => self
-                .accounts
-                .iter()
-                .any(|a| a.username == user && a.password == pass),
-            None => false,
-        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()?;
+        let creds = std::str::from_utf8(&decoded).ok()?;
+        let (user, pass) = creds.split_once(':')?;
+        self.accounts
+            .iter()
+            .find(|a| a.username == user && a.password == pass)
+            .map(|a| a.username.as_str())
+    }
+}
+
+impl Proxy for Http {
+    type Auth = ();
+
+    fn networks(&self) -> &[Network] {
+        NETWORKS
     }
 
-    pub async fn process(
-        &self,
-        ctx: &Ctx,
-        mut conn: Stream,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> io::Result<()> {
-        let (head, body) = read_header(&mut conn, policy.handshake, MAX_HEAD, parse_head).await?;
+    async fn decode<S>(&self, ctx: Ctx, mut stream: S) -> io::Result<ProxyDecision>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (head, body) = read_header(
+            &mut stream,
+            self.cx.policy.handshake_timeout,
+            MAX_HEAD,
+            parse_head,
+        )
+        .await?;
 
         let text = std::str::from_utf8(&head).map_err(|_| invalid("http: non-utf8 head"))?;
         let mut lines = text.split("\r\n");
@@ -105,33 +120,50 @@ impl Http {
             headers.push(line);
         }
 
-        if !self.accounts.is_empty() && !self.check_auth(&headers) {
-            conn.write_all(
-                b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                  Proxy-Authenticate: Basic realm=\"proxy\"\r\n\
-                  Connection: close\r\n\r\n",
-            )
-            .await?;
-            return Ok(());
-        }
+        // Authenticate (Basic). Attribute the session only when an account
+        // matches; an inbound with no accounts is open and passes the session
+        // through unattributed. A required-but-failed auth answers 407 and drops
+        // the connection (the tree treats the no-op decision as freedom's drop).
+        let ctx = if self.accounts.is_empty() {
+            ctx
+        } else {
+            match self.check_auth(&headers) {
+                Some(user) => {
+                    let hash = user_hash(user.as_bytes());
+                    ctx.with_user(user, hash)
+                }
+                None => {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                              Proxy-Authenticate: Basic realm=\"proxy\"\r\n\
+                              Connection: close\r\n\r\n",
+                        )
+                        .await?;
+                    return Ok(noop_decision(ctx));
+                }
+            }
+        };
 
-        let timer = Timer::new(policy.idle);
+        let timer = Timer::new(self.cx.policy.idle_timeout);
 
         if method.eq_ignore_ascii_case("CONNECT") {
             // authority-form target: host:port (port defaults to 443).
             let (address, port) = parse_authority(target, 443)?;
-            conn.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await?;
-            // `body` holds the first already-read bytes of the tunneled stream.
-            return relay_tcp(
-                conn,
-                Destination::tcp(address, port),
-                body,
+            // `body` holds the first already-read bytes of the tunneled stream;
+            // it seeds the uplink before live client bytes flow.
+            let target = sniff_override(Destination::tcp(address, port), &body);
+            let (inbound, outbound) = pipe(LINK_CAPACITY);
+            let counter = user_counter(&ctx, self.cx.stats.as_ref()).await;
+            tokio::spawn(relay_stream(stream, inbound, timer, counter, body));
+            return Ok(ProxyDecision {
+                target,
                 ctx,
-                disp,
-                timer,
-            )
-            .await;
+                link: outbound,
+            });
         }
 
         // Plain proxied request: derive the destination + the origin-form line.
@@ -183,15 +215,18 @@ impl Http {
         out.put_slice(b"\r\n");
         out.put_slice(&body);
 
-        relay_tcp(
-            conn,
-            Destination::tcp(address, port),
-            out.freeze(),
+        // The rewritten origin-form request head (+ any already-read body) is the
+        // uplink `leftover`: `relay_stream` forwards it before pumping live bytes.
+        let leftover = out.freeze();
+        let target = Destination::tcp(address, port);
+        let (inbound, outbound) = pipe(LINK_CAPACITY);
+        let counter = user_counter(&ctx, self.cx.stats.as_ref()).await;
+        tokio::spawn(relay_stream(stream, inbound, timer, counter, leftover));
+        Ok(ProxyDecision {
+            target,
             ctx,
-            disp,
-            timer,
-        )
-        .await
+            link: outbound,
+        })
     }
 }
 
@@ -280,16 +315,4 @@ fn parse_authority(s: &str, default_port: u16) -> io::Result<(Address, u16)> {
 
 fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
-}
-
-impl ProxyInbound for Http {
-    async fn serve(
-        &self,
-        ctx: &Ctx,
-        conn: Stream,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> io::Result<()> {
-        Http::process(self, ctx, conn, disp, policy).await
-    }
 }

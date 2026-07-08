@@ -14,17 +14,21 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use kernel::types::net::AddrCodec;
-use kernel::{Ctx, Destination, Dispatcher, Policy, Timer, UdpLink, UdpPacket};
-use transport::Stream;
+use kernel::net::AddrCodec;
+use kernel::{
+    Counter, Ctx, Destination, LINK_CAPACITY, Network, Proxy, ProxyDecision, Timer, UdpLink,
+    UdpPacket, pipe, udp_pipe,
+};
 
+use crate::ProxyContext;
 use crate::crypto::{Aead, AeadKind, NonceCtr, evp_bytes_to_key, hkdf_sha1};
-use crate::io::{ChunkRead, ChunkWrite, relay_framed, user_counter};
-use crate::{ProxyInbound, UdpProxyInbound};
+use crate::io::{ChunkRead, ChunkWrite, relay_framed, user_counter, user_hash};
+use crate::udp::freedom_udp;
 
 const TAG: usize = AeadKind::TAG;
 const SUBKEY_INFO: &[u8] = b"ss-subkey";
 const MAX_CHUNK: usize = 0x3fff;
+const NETWORKS: &[Network] = &[Network::Tcp, Network::Udp];
 
 /// Parse a Shadowsocks method name into an [`AeadKind`].
 pub fn method_kind(name: &str) -> Option<AeadKind> {
@@ -51,6 +55,7 @@ pub struct SsUser {
 pub struct Shadowsocks {
     kind: AeadKind,
     users: arc_swap::ArcSwap<Vec<SsUser>>,
+    cx: ProxyContext,
 }
 
 /// Derive the per-user master keys for a method.
@@ -71,13 +76,14 @@ where
 
 impl Shadowsocks {
     /// Build from a method and `(password, email, level)` users.
-    pub fn new<I>(kind: AeadKind, users: I) -> Shadowsocks
+    pub fn new<I>(kind: AeadKind, users: I, cx: ProxyContext) -> Shadowsocks
     where
         I: IntoIterator<Item = (String, CompactString, u32)>,
     {
         Shadowsocks {
             kind,
             users: arc_swap::ArcSwap::from(Arc::new(build_ss_users(kind, users))),
+            cx,
         }
     }
 
@@ -89,13 +95,22 @@ impl Shadowsocks {
         self.users.store(Arc::new(build_ss_users(self.kind, users)));
     }
 
-    pub async fn process(
-        &self,
-        ctx: &Ctx,
-        mut conn: Stream,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> io::Result<()> {
+    pub fn networks(&self) -> &'static [Network] {
+        NETWORKS
+    }
+}
+
+impl Proxy for Shadowsocks {
+    type Auth = ();
+
+    fn networks(&self) -> &[Network] {
+        NETWORKS
+    }
+
+    async fn decode<S>(&self, ctx: Ctx, mut stream: S) -> io::Result<ProxyDecision>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let kind = self.kind;
         let ksize = kind.key_size();
         let nsize = kind.nonce_size();
@@ -103,9 +118,9 @@ impl Shadowsocks {
         // Salt + first length chunk under the handshake deadline.
         let mut salt = vec![0u8; ksize];
         let mut lenct = vec![0u8; 2 + TAG];
-        timeout(policy.handshake, async {
-            conn.read_exact(&mut salt).await?;
-            conn.read_exact(&mut lenct).await
+        timeout(self.cx.policy.handshake_timeout, async {
+            stream.read_exact(&mut salt).await?;
+            stream.read_exact(&mut lenct).await
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
@@ -131,13 +146,14 @@ impl Shadowsocks {
         }
         let (user, aead, mut nonce, lenpt) =
             matched.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ss auth failed"))?;
-        let ctx = ctx.with_user(user.email.clone());
-        let ctx = &ctx;
-        let counter = user_counter(ctx, disp).await;
+        let email = user.email.clone();
+        let hash = user_hash(email.as_bytes());
+        let ctx = ctx.with_user(email, hash);
+        let counter = user_counter(&ctx, self.cx.stats.as_ref()).await;
 
         let length = chunk_len(&lenpt)?;
         let mut payct = vec![0u8; length.checked_add(TAG).unwrap_or(length)];
-        conn.read_exact(&mut payct).await?;
+        stream.read_exact(&mut payct).await?;
         let plain = aead
             .open(nonce.bytes(), &payct)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -154,27 +170,31 @@ impl Shadowsocks {
         // Server response salt + downlink cipher.
         let mut ssalt = vec![0u8; ksize];
         rand::fill(&mut ssalt);
-        conn.write_all(&ssalt).await?;
+        stream.write_all(&ssalt).await?;
         let mut dsub = vec![0u8; ksize];
         hkdf_sha1(&user.master, &ssalt, SUBKEY_INFO, &mut dsub).map_err(io::Error::other)?;
         let daead = Aead::new(kind, &dsub).map_err(io::Error::other)?;
         let dnonce = NonceCtr::new(nsize);
 
-        let timer = Timer::new(policy.idle);
-        let link = disp.dispatch_tcp(ctx, dest, timer.clone());
-        relay_framed(
-            conn,
+        let timer = Timer::new(self.cx.policy.idle_timeout);
+        let (inbound, outbound) = pipe(LINK_CAPACITY);
+        tokio::spawn(relay_framed(
+            stream,
             SsChunks { aead, nonce },
             SsChunks {
                 aead: daead,
                 nonce: dnonce,
             },
-            link,
+            inbound,
             timer,
             counter,
             leftover,
-        )
-        .await
+        ));
+        Ok(ProxyDecision {
+            target: dest,
+            ctx,
+            link: outbound,
+        })
     }
 }
 
@@ -324,18 +344,14 @@ impl Shadowsocks {
         None
     }
 
-    /// Serve the SS UDP socket: one dispatcher session per client source addr.
-    pub async fn serve_udp(
-        &self,
-        socket: Arc<UdpSocket>,
-        ctx: &Ctx,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> io::Result<()> {
-        let mut sessions: HashMap<
-            SocketAddr,
-            (mpsc::Sender<UdpPacket>, Option<Arc<kernel::Counter>>),
-        > = HashMap::new();
+    /// Serve the standalone SS UDP socket: one direct-egress session per client
+    /// source addr. Each session self-services its egress through the shared
+    /// dialer via [`freedom_udp`] over a private [`udp_pipe`] — replacing the
+    /// old dispatcher-owned `UdpLink` — while replies are re-framed with the
+    /// decoded user's master key and sent back to the client.
+    pub async fn serve_udp(&self, socket: Arc<UdpSocket>, ctx: Ctx) -> io::Result<()> {
+        let mut sessions: HashMap<SocketAddr, (mpsc::Sender<UdpPacket>, Option<Arc<Counter>>)> =
+            HashMap::new();
         let (reap_tx, mut reap_rx) = mpsc::channel::<SocketAddr>(64);
         let mut buf = vec![0u8; 65535];
         loop {
@@ -350,14 +366,21 @@ impl Shadowsocks {
                     let (tx, counter) = if let Some((tx, c)) = sessions.get(&from) {
                         (tx.clone(), c.clone())
                     } else {
-                        let maybe_counter =
-                            if let Some(stats) = disp.stats() {
-                                Some(stats.counter(&email).await)
-                            } else {
-                                None
-                            };
-                        let timer = Timer::new(policy.idle);
-                        let UdpLink { mut reader, writer } = disp.dispatch_udp(ctx, timer);
+                        // Per-user counter keyed by this datagram's decoded user.
+                        let hash = user_hash(email.as_bytes());
+                        let uctx = ctx.with_user(email, hash);
+                        let maybe_counter = user_counter(&uctx, self.cx.stats.as_ref()).await;
+                        // Private pipe: keep the inbound half, hand the outbound
+                        // half to freedom_udp for direct egress through the dialer.
+                        let timer = Timer::new(self.cx.policy.idle_timeout);
+                        let (inbound, outbound) = udp_pipe(LINK_CAPACITY);
+                        let UdpLink { mut reader, writer } = inbound;
+                        tokio::spawn(freedom_udp(
+                            self.cx.dialer.clone(),
+                            outbound,
+                            timer,
+                        ));
+                        // Downlink: re-frame each reply for the client and send it back.
                         let sock = socket.clone();
                         let kind = self.kind;
                         let reap = reap_tx.clone();
@@ -386,29 +409,5 @@ impl Shadowsocks {
                 }
             }
         }
-    }
-}
-
-impl ProxyInbound for Shadowsocks {
-    async fn serve(
-        &self,
-        ctx: &Ctx,
-        conn: Stream,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> io::Result<()> {
-        Shadowsocks::process(self, ctx, conn, disp, policy).await
-    }
-}
-
-impl UdpProxyInbound for Shadowsocks {
-    async fn serve_udp(
-        &self,
-        socket: Arc<UdpSocket>,
-        ctx: &Ctx,
-        disp: &Dispatcher,
-        policy: &Policy,
-    ) -> io::Result<()> {
-        Shadowsocks::serve_udp(self, socket, ctx, disp, policy).await
     }
 }
